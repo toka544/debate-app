@@ -10,7 +10,7 @@ let messages = [];
  * Health check
  */
 app.get("/", (req, res) => {
-  res.type("text").send("🔥 Debate app is running");
+  res.redirect("/debate");
 });
 
 /**
