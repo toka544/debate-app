@@ -600,7 +600,7 @@ app.get("/debate/:id", async (req, res) => {
   }
 
   function loadMessages() {
-    fetch(\`/debate/\${debateId}/messages?sort=\${sort}\`)
+    fetch(\`/debate/\${debateId}/messages\`)
       .then(r => r.json())
       .then(render)
       .catch(() => {
@@ -626,5 +626,5 @@ function escapeHtml(s) {
 // ---------- PORT ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server listening on port ${PORT}`);
+  console.log("Server listening on port " + PORT);
 });
