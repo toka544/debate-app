@@ -1,40 +1,59 @@
+-- ─────────────────────────────────────────
 -- USERS
-create table if not exists users (
-  id bigserial primary key,
-  username text unique not null,
-  rating int not null default 0,
-  created_at timestamptz not null default now()
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS users (
+  id        BIGSERIAL PRIMARY KEY,
+  username  TEXT UNIQUE NOT NULL,
+  rating    INT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- One debate for MVP (you can add more later)
-create table if not exists debates (
-  id bigserial primary key,
-  question text not null,
-  created_at timestamptz not null default now()
+-- ─────────────────────────────────────────
+-- DEBATES
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS debates (
+  id         BIGSERIAL PRIMARY KEY,
+  question   TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- ARGUMENTS
-create table if not exists messages (
-  id bigserial primary key,
-  debate_id bigint not null references debates(id) on delete cascade,
-  user_id bigint not null references users(id) on delete cascade,
-  side text not null check (side in ('YES','NO')),
-  text text not null,
-  score int not null default 0,
-  created_at timestamptz not null default now()
+-- ─────────────────────────────────────────
+-- MESSAGES (arguments)
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS messages (
+  id         BIGSERIAL PRIMARY KEY,
+  debate_id  BIGINT NOT NULL REFERENCES debates(id) ON DELETE CASCADE,
+  user_id    BIGINT NOT NULL REFERENCES users(id)   ON DELETE CASCADE,
+  side       TEXT NOT NULL CHECK (side IN ('YES', 'NO')),
+  text       TEXT NOT NULL,
+  score      INT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- VOTES (one vote per user per message)
-create table if not exists votes (
-  id bigserial primary key,
-  message_id bigint not null references messages(id) on delete cascade,
-  user_id bigint not null references users(id) on delete cascade,
-  value int not null check (value in (-1, 1)),
-  created_at timestamptz not null default now(),
-  unique(message_id, user_id)
+-- ─────────────────────────────────────────
+-- VOTES
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS votes (
+  id         BIGSERIAL PRIMARY KEY,
+  message_id BIGINT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  user_id    BIGINT NOT NULL REFERENCES users(id)    ON DELETE CASCADE,
+  value      INT NOT NULL CHECK (value IN (-1, 1)),
+  weight     INT NOT NULL DEFAULT 1,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (message_id, user_id)
 );
 
--- seed default debate (id=1) if empty
-insert into debates (question)
-select 'Is university education still worth it?'
-where not exists (select 1 from debates);
+-- ─────────────────────────────────────────
+-- INDEXES (performance)
+-- ─────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_messages_debate_new  ON messages(debate_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_debate_top  ON messages(debate_id, score DESC, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_votes_message_user   ON votes(message_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_users_rating         ON users(rating DESC, id ASC);
+
+-- ─────────────────────────────────────────
+-- SEED: default debate (only if table empty)
+-- ─────────────────────────────────────────
+INSERT INTO debates (question)
+SELECT 'Is university education still worth it?'
+WHERE NOT EXISTS (SELECT 1 FROM debates);
