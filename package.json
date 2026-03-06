@@ -4,7 +4,7 @@
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node index.js",
+    "start": "node migrate.js && node index.js",
     "dev": "node index.js",
     "migrate": "node migrate.js"
   },
