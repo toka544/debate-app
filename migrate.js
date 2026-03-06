@@ -1,5 +1,5 @@
 require("dotenv").config();
-const fs     = require("fs");
+const fs = require("fs");
 const { Client } = require("pg");
 
 async function run() {
