@@ -1,5 +1,5 @@
 require("dotenv").config();
-const fs = require("fs");
+const fs     = require("fs");
 const { Client } = require("pg");
 
 async function run() {
@@ -9,14 +9,10 @@ async function run() {
       ? { rejectUnauthorized: false }
       : undefined,
   });
-
   try {
     await client.connect();
     console.log("✅ Connected to DB");
-
-    const sql = fs.readFileSync("./db.sql", "utf8");
-    await client.query(sql);
-
+    await client.query(fs.readFileSync("./db.sql", "utf8"));
     console.log("✅ Migration complete");
   } catch (err) {
     console.error("❌ Migration failed:", err);
