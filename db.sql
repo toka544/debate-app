@@ -90,7 +90,7 @@ CREATE INDEX IF NOT EXISTS idx_page_views_path      ON page_views(path, created_
 -- ─────────────────────────────────────────
 DO $$
 BEGIN
-  IF (SELECT COUNT(*) FROM debates) = 0 THEN
+  IF (SELECT COUNT(*) FROM debates) < 2 THEN
     INSERT INTO debates (question, category) VALUES
       ('Is college a scam?',                              'Education'),
       ('Should billionaires exist?',                      'Economy'),
