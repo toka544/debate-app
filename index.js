@@ -122,6 +122,84 @@ app.get("/me", wrap(async (req, res) => {
 }));
 
 // ─────────────────────────────────────────────────────────
+// Google OAuth
+// ─────────────────────────────────────────────────────────
+const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID     || "";
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
+const GOOGLE_REDIRECT      = process.env.GOOGLE_REDIRECT_URI  ||
+  "https://debate-app-o3qw.onrender.com/auth/google/callback";
+
+// Step 1 — redirect user to Google
+app.get("/auth/google", (req, res) => {
+  if (!GOOGLE_CLIENT_ID) return res.status(500).send("Google auth not configured");
+  const params = new URLSearchParams({
+    client_id:     GOOGLE_CLIENT_ID,
+    redirect_uri:  GOOGLE_REDIRECT,
+    response_type: "code",
+    scope:         "openid email profile",
+    prompt:        "select_account",
+  });
+  res.redirect("https://accounts.google.com/o/oauth2/v2/auth?" + params.toString());
+});
+
+// Step 2 — Google calls us back with ?code=
+app.get("/auth/google/callback", wrap(async (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.redirect("/?error=no_code");
+
+  // Exchange code for tokens
+  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      code,
+      client_id:     GOOGLE_CLIENT_ID,
+      client_secret: GOOGLE_CLIENT_SECRET,
+      redirect_uri:  GOOGLE_REDIRECT,
+      grant_type:    "authorization_code",
+    }),
+  });
+  const tokens = await tokenRes.json();
+  if (!tokens.access_token) {
+    console.error("Google token error:", tokens);
+    return res.redirect("/?error=token_failed");
+  }
+
+  // Get user info from Google
+  const infoRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+    headers: { Authorization: "Bearer " + tokens.access_token },
+  });
+  const info = await infoRes.json();
+  if (!info.email) return res.redirect("/?error=no_email");
+
+  // Build a clean username from Google name/email
+  const base = (info.name || info.email.split("@")[0])
+    .replace(/[^a-zA-Z0-9_]/g, "_")
+    .replace(/_+/g, "_")
+    .slice(0, 18);
+  const username = base || "user";
+
+  // Upsert user — if username taken, append short suffix
+  let finalUsername = username;
+  const existing = await pool.query(
+    "SELECT username FROM users WHERE username = $1", [finalUsername]
+  );
+  // if the username belongs to a DIFFERENT Google account, add suffix
+  if (existing.rows[0]) {
+    const suffix = info.id ? info.id.slice(-4) : Math.floor(Math.random()*9000+1000).toString();
+    finalUsername = (username.slice(0, 14) + "_" + suffix).slice(0, 20);
+  }
+
+  await pool.query(
+    "INSERT INTO users (username) VALUES ($1) ON CONFLICT (username) DO NOTHING",
+    [finalUsername]
+  );
+
+  res.cookie("username", finalUsername, { httpOnly: true, sameSite: "lax" });
+  res.redirect("/");
+}));
+
+// ─────────────────────────────────────────────────────────
 // API: debates
 // ─────────────────────────────────────────────────────────
 app.get("/api/debates", wrap(async (req, res) => {
@@ -596,7 +674,12 @@ function homePage() {
     if(!me){
       navRight.innerHTML='';
       authArea.innerHTML=\`
-        <input class="auth-input" id="username" placeholder="Pick a username…" maxlength="20"/>
+        <a href="/auth/google" style="display:inline-flex;align-items:center;gap:8px;padding:11px 20px;border-radius:12px;border:1px solid var(--border2);background:var(--bg2);color:var(--text);font-size:13px;font-weight:600;text-decoration:none;transition:background .18s;" onmouseover="this.style.background='#1e2028'" onmouseout="this.style.background='var(--bg2)'">
+          <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+          Continue with Google
+        </a>
+        <span style="font-size:12px;color:var(--muted)">or</span>
+        <input class="auth-input" id="username" placeholder="Just enter a username…" maxlength="20" style="width:180px"/>
         <button class="btn-primary" id="loginBtn">JOIN</button>\`;
       document.getElementById("loginBtn").addEventListener("click", async()=>{
         const username=document.getElementById("username").value.trim();
@@ -812,6 +895,11 @@ function debatePage(debateId, question, category) {
         <div class="card-label">Account</div>
         <div class="me-info" id="meBox">Loading…</div>
         <div id="loginBox" style="display:none">
+          <a href="/auth/google" style="display:flex;align-items:center;justify-content:center;gap:8px;padding:10px;border-radius:10px;border:1px solid var(--border2);background:var(--bg3);color:var(--text);font-size:13px;font-weight:600;text-decoration:none;margin-bottom:10px;transition:background .18s;" onmouseover="this.style.background='#1e2028'" onmouseout="this.style.background='var(--bg3)'">
+            <svg width="16" height="16" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+            Continue with Google
+          </a>
+          <div style="text-align:center;font-size:11px;color:var(--muted);margin-bottom:8px;">or just pick a username</div>
           <input class="auth-input" id="username" placeholder="Pick a username…" maxlength="20"/>
           <button class="join-btn" id="loginBtn">Join debate</button>
         </div>
