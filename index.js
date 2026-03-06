@@ -1277,98 +1277,131 @@ function adminPage() {
 
   // ── Load everything
   async function loadStats(){
-    const d=await api("/admin/api/stats").catch(()=>null);
-    if(!d)return;
+    let d;
+    try {
+      d = await api("/admin/api/stats");
+      if(!d || d.error) throw new Error(d?.error || "API failed");
+    } catch(e) {
+      document.getElementById("kpiRow").innerHTML=\`<div style="color:var(--no);font-size:13px">❌ Failed to load stats: \${e.message}</div>\`;
+      return;
+    }
 
-    // KPIs
-    document.getElementById("kpiRow").innerHTML=\`
-      <div class="kpi"><div class="kpi-n">\${d.debates}</div><div class="kpi-l">Debates</div></div>
-      <div class="kpi"><div class="kpi-n">\${d.users}</div><div class="kpi-l">Users</div></div>
-      <div class="kpi"><div class="kpi-n">\${d.messages}</div><div class="kpi-l">Arguments</div></div>
-      <div class="kpi"><div class="kpi-n">\${d.total_views}</div><div class="kpi-l">Page Views</div></div>
-      <div class="kpi"><div class="kpi-n" style="color:var(--accent)">\${d.unique_visitors}</div><div class="kpi-l">Unique Visitors</div></div>
-    \`;
+    // ── KPIs
+    try {
+      document.getElementById("kpiRow").innerHTML=\`
+        <div class="kpi"><div class="kpi-n">\${d.debates}</div><div class="kpi-l">Debates</div></div>
+        <div class="kpi"><div class="kpi-n">\${d.users}</div><div class="kpi-l">Users</div></div>
+        <div class="kpi"><div class="kpi-n">\${d.messages}</div><div class="kpi-l">Arguments</div></div>
+        <div class="kpi"><div class="kpi-n">\${d.total_views||0}</div><div class="kpi-l">Page Views</div></div>
+        <div class="kpi"><div class="kpi-n" style="color:var(--accent)">\${d.unique_visitors||0}</div><div class="kpi-l">Unique Visitors</div></div>
+      \`;
+    } catch(e) { console.error("KPI render error", e); }
 
-    // Chart
-    const daily=d.daily.slice().reverse();
-    const maxV=Math.max(...daily.map(r=>r.uniq),1);
-    document.getElementById("chart").innerHTML = daily.length
-      ? daily.map(r=>{
-          const h=Math.max(4,Math.round(r.uniq/maxV*100));
-          const date=new Date(r.day).toLocaleDateString("en-US",{month:"short",day:"numeric"});
+    // ── Chart
+    try {
+      const daily = (d.daily||[]).slice().reverse();
+      const maxV = daily.length > 0 ? Math.max(...daily.map(r=>Number(r.uniq)||0), 1) : 1;
+      const chartEl = document.getElementById("chart");
+      if (!daily.length) {
+        chartEl.innerHTML='<div style="color:var(--muted);font-size:13px;padding:8px 0">No visit data yet — open your site a few times first</div>';
+      } else {
+        chartEl.innerHTML = daily.map(r=>{
+          const h = Math.max(4, Math.round((Number(r.uniq)||0) / maxV * 100));
+          const date = r.day ? new Date(r.day).toLocaleDateString("en-US",{month:"short",day:"numeric"}) : "?";
           return \`<div class="chart-col">
-            <div class="chart-fill" style="height:\${h}px" title="\${r.uniq} unique · \${r.views} total"></div>
+            <div class="chart-fill" style="height:\${h}px" title="\${r.uniq||0} unique · \${r.views||0} total"></div>
             <div class="chart-lbl">\${date}</div>
           </div>\`;
-        }).join("")
-      : '<div style="color:var(--muted);font-size:13px">No data yet — visit your site first</div>';
+        }).join("");
+      }
+    } catch(e) {
+      document.getElementById("chart").innerHTML=\`<div style="color:var(--muted);font-size:13px">Chart error: \${e.message}</div>\`;
+      console.error("Chart render error", e);
+    }
 
-    // Debates table with expandable args
-    const debates = d.top_debates;
-    const tbody = debates.map(dbt=>\`
-      <tr class="debate-row" data-id="\${dbt.id}">
-        <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${esc(dbt.question)}</td>
-        <td>\${esc(dbt.category)}</td>
-        <td>\${dbt.arg_count}</td>
-        <td>\${dbt.views}</td>
-        <td><span class="badge \${dbt.active?"on":"off"}">\${dbt.active?"Active":"Hidden"}</span></td>
-        <td>
-          <div style="display:flex;gap:5px;flex-wrap:wrap">
-            <button class="btn-sm btn-success" onclick="event.stopPropagation();toggleDebate(\${dbt.id})">\${dbt.active?"Hide":"Show"}</button>
-            <button class="btn-sm btn-danger"  onclick="event.stopPropagation();delDebate(\${dbt.id})">Delete all</button>
-          </div>
-        </td>
-      </tr>
-      <tr class="args-row" id="args-\${dbt.id}">
-        <td colspan="6" style="padding:0">
-          <div class="args-inner" id="args-inner-\${dbt.id}">
-            <div style="color:var(--muted);font-size:13px;padding:12px 0">Loading arguments…</div>
-          </div>
-        </td>
-      </tr>
-    \`).join("");
-
-    document.getElementById("debatesTable").innerHTML=\`
-      <table class="table">
-        <thead><tr>
-          <th>Question</th><th>Category</th><th>Args</th><th>Views</th><th>Status</th><th>Actions</th>
-        </tr></thead>
-        <tbody>\${tbody}</tbody>
-      </table>
-    \`;
-
-    // Expand rows on click
-    document.querySelectorAll(".debate-row").forEach(row=>{
-      row.addEventListener("click",()=>{
-        const id=row.dataset.id;
-        const isOpen=row.classList.contains("open");
-        // close all
-        document.querySelectorAll(".debate-row").forEach(r=>r.classList.remove("open"));
-        document.querySelectorAll(".args-row").forEach(r=>r.classList.remove("open"));
-        if(!isOpen){
-          row.classList.add("open");
-          document.getElementById("args-"+id).classList.add("open");
-          loadArgs(id);
-        }
-      });
-    });
-
-    // Users table
-    document.getElementById("usersTable").innerHTML=\`
-      <table class="table">
-        <thead><tr><th>Username</th><th>Rating</th><th>Arguments</th><th>Joined</th></tr></thead>
-        <tbody>
-        \${d.recent_users.map(u=>\`
-          <tr>
-            <td><a href="/u/\${esc(u.username)}" style="font-weight:600">\${esc(u.username)}</a></td>
-            <td style="color:var(--gold);font-weight:700">\${u.rating}</td>
-            <td>\${u.arg_count}</td>
-            <td style="color:var(--muted)">\${new Date(u.created_at).toLocaleDateString()}</td>
+    // ── Debates table
+    try {
+      const debates = d.top_debates || [];
+      if (!debates.length) {
+        document.getElementById("debatesTable").innerHTML='<div style="color:var(--muted);font-size:13px">No debates yet</div>';
+      } else {
+        const tbody = debates.map(dbt=>\`
+          <tr class="debate-row" data-id="\${dbt.id}">
+            <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${esc(dbt.question)}</td>
+            <td>\${esc(dbt.category||'')}</td>
+            <td>\${dbt.arg_count||0}</td>
+            <td>\${dbt.views||0}</td>
+            <td><span class="badge \${dbt.active?"on":"off"}">\${dbt.active?"Active":"Hidden"}</span></td>
+            <td>
+              <div style="display:flex;gap:5px;flex-wrap:wrap">
+                <button class="btn-sm btn-success" onclick="event.stopPropagation();toggleDebate(\${dbt.id})">\${dbt.active?"Hide":"Show"}</button>
+                <button class="btn-sm btn-danger"  onclick="event.stopPropagation();delDebate(\${dbt.id})">Delete all</button>
+              </div>
+            </td>
           </tr>
-        \`).join("")}
-        </tbody>
-      </table>
-    \`;
+          <tr class="args-row" id="args-\${dbt.id}">
+            <td colspan="6" style="padding:0">
+              <div class="args-inner" id="args-inner-\${dbt.id}">
+                <div style="color:var(--muted);font-size:13px;padding:12px 0">Click the row above to load arguments</div>
+              </div>
+            </td>
+          </tr>
+        \`).join("");
+
+        document.getElementById("debatesTable").innerHTML=\`
+          <table class="table">
+            <thead><tr>
+              <th>Question</th><th>Category</th><th>Args</th><th>Views</th><th>Status</th><th>Actions</th>
+            </tr></thead>
+            <tbody>\${tbody}</tbody>
+          </table>
+        \`;
+
+        document.querySelectorAll(".debate-row").forEach(row=>{
+          row.addEventListener("click",()=>{
+            const id=row.dataset.id;
+            const isOpen=row.classList.contains("open");
+            document.querySelectorAll(".debate-row").forEach(r=>r.classList.remove("open"));
+            document.querySelectorAll(".args-row").forEach(r=>r.classList.remove("open"));
+            if(!isOpen){
+              row.classList.add("open");
+              document.getElementById("args-"+id).classList.add("open");
+              loadArgs(id);
+            }
+          });
+        });
+      }
+    } catch(e) {
+      document.getElementById("debatesTable").innerHTML=\`<div style="color:var(--no);font-size:13px">Error: \${e.message}</div>\`;
+      console.error("Debates render error", e);
+    }
+
+    // ── Users table
+    try {
+      const users = d.recent_users || [];
+      if (!users.length) {
+        document.getElementById("usersTable").innerHTML='<div style="color:var(--muted);font-size:13px">No users yet</div>';
+      } else {
+        document.getElementById("usersTable").innerHTML=\`
+          <table class="table">
+            <thead><tr><th>Username</th><th>Rating</th><th>Arguments</th><th>Joined</th></tr></thead>
+            <tbody>
+            \${users.map(u=>\`
+              <tr>
+                <td><a href="/u/\${esc(u.username)}" style="font-weight:600">\${esc(u.username)}</a></td>
+                <td style="color:var(--gold);font-weight:700">\${u.rating}</td>
+                <td>\${u.arg_count||0}</td>
+                <td style="color:var(--muted)">\${u.created_at ? new Date(u.created_at).toLocaleDateString() : "—"}</td>
+              </tr>
+            \`).join("")}
+            </tbody>
+          </table>
+        \`;
+      }
+    } catch(e) {
+      document.getElementById("usersTable").innerHTML=\`<div style="color:var(--no);font-size:13px">Error: \${e.message}</div>\`;
+      console.error("Users render error", e);
+    }
   }
 
   // ── Load arguments for a debate
