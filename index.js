@@ -565,6 +565,10 @@ app.get("/explore", wrap(async (req, res) => {
   res.type("html").send(explorePage());
 }));
 
+app.get("/live", wrap(async (req, res) => {
+  res.type("html").send(livePage());
+}));
+
 app.get("/debate", (req, res) => res.redirect("/explore"));
 
 app.get("/debate/:id", wrap(async (req, res) => {
@@ -743,10 +747,13 @@ function landingPage() {
   <div class="hero">
     <div class="hero-eyebrow"><span class="live-dot"></span>Live debates happening now</div>
     <h1>The world<br>says <span class="yes">YES</span><br>or <span class="no">NO</span></h1>
-    <p class="hero-sub">Pick a side on the events and questions that define our time. Argue your case. Let the crowd decide who wins.</p>
+    <!-- Quick Take — loads dynamically -->
+    <div id="quickWidget" style="width:100%;max-width:560px;background:var(--bg2);border:1px solid var(--border2);border-radius:24px;padding:28px;margin-bottom:28px;">
+      <div style="color:var(--muted);font-size:13px;text-align:center">Loading debate…</div>
+    </div>
     <div class="hero-actions">
-      <a href="/explore" class="btn-big btn-big-primary">Enter the arena →</a>
-      <a href="#how" class="btn-big btn-big-outline">How it works</a>
+      <a href="/explore" class="btn-big btn-big-primary">See all debates →</a>
+      <a href="/live" class="btn-big btn-big-outline">⚡ Live now</a>
     </div>
   </div>
 </div>
@@ -821,18 +828,14 @@ function landingPage() {
     </div>
   </div>
 
-  <!-- QUICK TAKE -->
-  <div class="section" style="padding-top:0">
-    <div class="section-label">Quick take</div>
-    <h2>What do <em style="font-style:normal;color:var(--accent)">you</em> think?</h2>
-    <div id="quickWidget" style="max-width:580px;margin:0 auto;background:var(--bg2);border:1px solid var(--border);border-radius:24px;padding:28px;"></div>
-  </div>
-
   <!-- CTA -->
   <div class="cta-bottom">
-    <h2>Ready to argue?</h2>
-    <p>Join thousands of debaters. Your opinion matters.</p>
-    <a href="/explore" class="btn-big btn-big-primary">Start debating →</a>
+    <h2>Join the debate.</h2>
+    <p>Real questions. Real arguments. The crowd decides who wins.</p>
+    <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
+      <a href="/explore" class="btn-big btn-big-primary">Browse all debates →</a>
+      <a href="/live" class="btn-big btn-big-outline">⚡ Live now</a>
+    </div>
   </div>
 </div>
 
@@ -1864,22 +1867,28 @@ function adminPage() {
   async function loadAll() {
     let d;
     try {
-      d = await api("/admin/api/stats");
+      const resp = await fetch("/admin/api/stats", {headers:{"content-type":"application/json"}});
+      const text = await resp.text();
+      try { d = JSON.parse(text); } catch(pe) {
+        document.getElementById("kpiRow").innerHTML =
+          '<div style="color:var(--no);font-size:13px">❌ Bad JSON from server: '+text.slice(0,120)+'</div>';
+        return;
+      }
       if(!d || d.error) throw new Error(d?.error || "API error");
     } catch(e) {
       document.getElementById("kpiRow").innerHTML =
-        '<div style="color:var(--no);font-size:13px">Error loading stats: '+e.message+'</div>';
+        '<div style="color:var(--no);font-size:13px">❌ '+e.message+'</div>';
       return;
     }
     allDebates = d.top_debates || [];
     allUsers   = d.recent_users || [];
     dailyData  = d.daily || [];
     statsData  = d;
-    renderKpis();
-    renderChart();
-    renderDebatesTable();
-    renderCategories();
-    renderUsers();
+    try { renderKpis(); } catch(e) { document.getElementById("kpiRow").innerHTML='<div style="color:var(--no);font-size:13px">KPI error: '+e.message+'</div>'; }
+    try { renderChart(); } catch(e) { document.getElementById("chart").innerHTML='<div style="color:var(--no);font-size:13px">Chart error: '+e.message+'</div>'; }
+    try { renderDebatesTable(); } catch(e) { document.getElementById("debatesTable").innerHTML='<div style="color:var(--no);font-size:13px">Debates error: '+e.message+'</div>'; }
+    try { renderCategories(); } catch(e) { document.getElementById("categoriesPanel").innerHTML='<div style="color:var(--no);font-size:13px">Categories error: '+e.message+'</div>'; }
+    try { renderUsers(); } catch(e) { document.getElementById("usersTable").innerHTML='<div style="color:var(--no);font-size:13px">Users error: '+e.message+'</div>'; }
   }
 
   function renderKpis() {
@@ -2106,6 +2115,316 @@ function adminPage() {
   });
 
   loadAll();
+</script>
+</body></html>`;
+}
+
+// ─────────────────────────────────────────────────────────
+// LIVE PAGE (/live)
+// ─────────────────────────────────────────────────────────
+function livePage() {
+  return `<!doctype html><html lang="en">
+<head>
+  <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Live Debates — ARGU</title>
+  ${BASE_CSS}
+  <style>
+    body{overflow:hidden;}
+    .live-wrap{position:fixed;inset:0;display:flex;flex-direction:column;}
+    /* Nav */
+    .live-nav{display:flex;align-items:center;justify-content:space-between;padding:0 28px;height:56px;border-bottom:1px solid var(--border);background:rgba(11,12,16,.9);backdrop-filter:blur(18px);flex-shrink:0;z-index:10;}
+    .live-badge{display:inline-flex;align-items:center;gap:6px;font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#ef4444;border:1px solid rgba(239,68,68,.35);background:rgba(239,68,68,.1);padding:4px 12px;border-radius:999px;}
+    .live-dot-red{width:6px;height:6px;border-radius:50%;background:#ef4444;animation:blink 1s infinite;}
+    @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
+    /* Main split */
+    .live-body{flex:1;display:grid;grid-template-columns:1fr 380px;overflow:hidden;}
+    @media(max-width:800px){.live-body{grid-template-columns:1fr;grid-template-rows:auto 1fr;}}
+    /* Left: question */
+    .live-left{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px;text-align:center;position:relative;overflow:hidden;border-right:1px solid var(--border);}
+    .live-category{font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin-bottom:16px;}
+    .live-q{font-family:'Unbounded',sans-serif;font-size:clamp(22px,3.5vw,44px);font-weight:900;letter-spacing:-0.03em;line-height:1.1;max-width:680px;margin-bottom:32px;transition:opacity .4s;}
+    .live-q.fade{opacity:0;}
+    /* Timer ring */
+    .timer-wrap{position:relative;width:80px;height:80px;margin:0 auto 28px;}
+    .timer-svg{transform:rotate(-90deg);}
+    .timer-track{fill:none;stroke:var(--border);stroke-width:4;}
+    .timer-fill{fill:none;stroke:var(--accent);stroke-width:4;stroke-linecap:round;transition:stroke-dashoffset .9s linear,stroke 1s;}
+    .timer-n{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:'Unbounded',sans-serif;font-size:22px;font-weight:900;}
+    /* Vote buttons */
+    .vote-row{display:flex;gap:14px;margin-bottom:24px;}
+    .vote-btn{flex:1;max-width:160px;padding:16px 20px;border-radius:16px;border:2px solid;font-family:'Unbounded',sans-serif;font-size:14px;font-weight:700;cursor:pointer;transition:all .18s;position:relative;overflow:hidden;}
+    .vote-yes{border-color:var(--yes);background:var(--yes-dim);color:var(--yes);}
+    .vote-yes:hover,.vote-yes.picked{background:var(--yes);color:#fff;}
+    .vote-no{border-color:var(--no);background:var(--no-dim);color:var(--no);}
+    .vote-no:hover,.vote-no.picked{background:var(--no);color:#fff;}
+    /* Score bar */
+    .score-row{display:flex;align-items:center;gap:10px;width:100%;max-width:400px;font-family:'Unbounded',sans-serif;font-size:13px;font-weight:700;}
+    .score-yes{color:var(--yes);min-width:44px;text-align:right;}
+    .score-no{color:var(--no);min-width:44px;}
+    .score-bar{flex:1;height:6px;background:var(--bg3);border-radius:999px;overflow:hidden;}
+    .score-fill{height:100%;background:linear-gradient(90deg,var(--yes),var(--no));border-radius:999px;transition:width .6s ease;}
+    /* Arg form */
+    .arg-form{width:100%;max-width:440px;margin-top:20px;}
+    .arg-form textarea{width:100%;padding:12px 14px;border-radius:12px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-family:'Manrope',sans-serif;font-size:13px;resize:none;outline:none;min-height:70px;}
+    .arg-form textarea:focus{border-color:rgba(59,130,246,.5);}
+    .arg-form-row{display:flex;align-items:center;justify-content:space-between;margin-top:8px;}
+    /* Right: feed */
+    .live-right{display:flex;flex-direction:column;overflow:hidden;}
+    .feed-header{padding:16px 20px;border-bottom:1px solid var(--border);font-family:'Unbounded',sans-serif;font-size:11px;font-weight:700;letter-spacing:.05em;flex-shrink:0;display:flex;align-items:center;gap:8px;}
+    .feed-list{flex:1;overflow-y:auto;padding:12px 16px;display:flex;flex-direction:column;gap:8px;}
+    .feed-item{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:12px 14px;animation:slideIn .25s ease both;font-size:13px;}
+    @keyframes slideIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
+    .feed-item-head{display:flex;align-items:center;gap:6px;margin-bottom:6px;}
+    .feed-pill{display:inline-block;padding:2px 7px;border-radius:999px;font-size:9px;font-weight:700;letter-spacing:.07em;}
+    .feed-pill.yes{background:var(--yes-dim);color:var(--yes);border:1px solid rgba(59,130,246,.3);}
+    .feed-pill.no{background:var(--no-dim);color:var(--no);border:1px solid rgba(239,68,68,.3);}
+    .feed-author{font-size:11px;font-weight:600;color:var(--muted2);}
+    .feed-text{color:rgba(234,237,243,.82);line-height:1.5;}
+    /* Next debate preview */
+    .next-bar{padding:12px 20px;border-top:1px solid var(--border);font-size:12px;color:var(--muted);flex-shrink:0;display:flex;align-items:center;gap:8px;}
+    .next-q{color:var(--muted2);font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    /* Login overlay */
+    .login-overlay{position:absolute;inset:0;background:rgba(11,12,16,.85);backdrop-filter:blur(6px);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;z-index:5;border-radius:0;}
+    .login-overlay.hidden{display:none;}
+  </style>
+</head>
+<body>
+<div class="live-wrap">
+  <nav class="live-nav">
+    <a class="logo" href="/">ARGU<span>.</span></a>
+    <div class="live-badge"><span class="live-dot-red"></span>LIVE</div>
+    <div id="navRight" style="font-size:13px;color:var(--muted2)"></div>
+  </nav>
+
+  <div class="live-body">
+    <!-- LEFT: question + voting -->
+    <div class="live-left" id="leftPane">
+      <div class="live-category" id="liveCategory">Loading…</div>
+      <div class="live-q" id="liveQ"></div>
+
+      <!-- Timer -->
+      <div class="timer-wrap">
+        <svg class="timer-svg" width="80" height="80" viewBox="0 0 80 80">
+          <circle class="timer-track" cx="40" cy="40" r="36"/>
+          <circle class="timer-fill" id="timerArc" cx="40" cy="40" r="36"
+            stroke-dasharray="226" stroke-dashoffset="0"/>
+        </svg>
+        <div class="timer-n" id="timerN">60</div>
+      </div>
+
+      <!-- Score bar -->
+      <div class="score-row">
+        <span class="score-yes" id="scoreYes">0</span>
+        <div class="score-bar"><div class="score-fill" id="scoreFill" style="width:50%"></div></div>
+        <span class="score-no" id="scoreNo">0</span>
+      </div>
+
+      <!-- Vote buttons -->
+      <div class="vote-row" style="margin-top:20px;">
+        <button class="vote-btn vote-yes" id="voteYes" onclick="castVote('YES')">✓ YES</button>
+        <button class="vote-btn vote-no"  id="voteNo"  onclick="castVote('NO')">✗ NO</button>
+      </div>
+
+      <!-- Arg form (shown after voting) -->
+      <div class="arg-form hidden" id="argForm">
+        <textarea id="argText" placeholder="Optional: add your argument (max 300 chars)" maxlength="300"></textarea>
+        <div class="arg-form-row">
+          <span style="font-size:11px;color:var(--muted)" id="argHint">0 / 300</span>
+          <button onclick="postArg()" style="padding:9px 20px;border-radius:10px;border:none;background:var(--accent);color:#fff;font-family:'Unbounded',sans-serif;font-size:10px;font-weight:700;cursor:pointer;">Post →</button>
+        </div>
+      </div>
+
+      <!-- Login overlay -->
+      <div class="login-overlay hidden" id="loginOverlay">
+        <div style="font-family:'Unbounded',sans-serif;font-size:16px;font-weight:700;margin-bottom:8px">Join to vote</div>
+        <a href="/auth/google" style="display:inline-flex;align-items:center;gap:7px;padding:11px 20px;border-radius:12px;border:1px solid var(--border2);background:var(--bg3);color:var(--text);font-size:13px;font-weight:600;text-decoration:none;">
+          <svg width="15" height="15" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+          Google
+        </a>
+        <div style="font-size:11px;color:var(--muted)">or</div>
+        <div style="display:flex;gap:8px">
+          <input id="liveUser" placeholder="username…" maxlength="20" style="padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-size:13px;outline:none;width:160px;"/>
+          <button onclick="quickJoin()" style="padding:10px 18px;border-radius:10px;border:none;background:var(--accent);color:#fff;font-family:'Unbounded',sans-serif;font-size:11px;font-weight:700;cursor:pointer;">Join</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT: live feed -->
+    <div class="live-right">
+      <div class="feed-header">
+        <span class="live-dot-red" style="width:7px;height:7px;border-radius:50%;background:#ef4444;animation:blink 1s infinite;display:inline-block;"></span>
+        Live arguments
+        <span id="feedCount" style="font-size:10px;color:var(--muted);margin-left:auto">0 arguments</span>
+      </div>
+      <div class="feed-list" id="feedList">
+        <div style="text-align:center;padding:40px;color:var(--muted);font-size:13px">Waiting for arguments…</div>
+      </div>
+      <div class="next-bar">
+        <span style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em">Next:</span>
+        <span class="next-q" id="nextQ">—</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  function esc(s){return String(s).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");}
+  async function api(url,opts={}){try{const r=await fetch(url,{headers:{"content-type":"application/json"},...opts});return r.json();}catch{return null;}}
+
+  let debates   = [];
+  let curIdx    = 0;
+  let me        = null;
+  let timerVal  = 60;
+  let timerInt  = null;
+  let pollInt   = null;
+  let pickedSide= null;
+  const ROUND_SEC = 60;
+  const CIRCUM    = 226; // 2*pi*36
+
+  async function init() {
+    const meR = await api("/me");
+    me = meR?.user || null;
+    if(me) document.getElementById("navRight").innerHTML =
+      '<a href="/u/'+esc(me.username)+'" style="font-weight:600;color:var(--text)">'+esc(me.username)+'</a>' +
+      '<span style="color:var(--gold);margin-left:6px">★'+me.rating+'</span>';
+
+    debates = await api("/api/debates") || [];
+    if(!debates.length){
+      document.getElementById("liveCategory").textContent = "No debates yet";
+      document.getElementById("liveQ").textContent = "Add some debates in the admin panel.";
+      return;
+    }
+    // shuffle
+    for(let i=debates.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[debates[i],debates[j]]=[debates[j],debates[i]];}
+    loadDebate(0);
+  }
+
+  function loadDebate(idx) {
+    curIdx    = idx % debates.length;
+    pickedSide= null;
+    timerVal  = ROUND_SEC;
+    clearInterval(timerInt);
+    clearInterval(pollInt);
+
+    const d = debates[curIdx];
+    const next = debates[(curIdx+1) % debates.length];
+
+    // Update UI
+    const qEl = document.getElementById("liveQ");
+    qEl.classList.add("fade");
+    setTimeout(()=>{
+      qEl.textContent = d.question;
+      document.getElementById("liveCategory").textContent = d.category || "General";
+      qEl.classList.remove("fade");
+    }, 400);
+
+    document.getElementById("nextQ").textContent = next.question;
+    document.getElementById("argForm").classList.add("hidden");
+    document.getElementById("loginOverlay").classList.add("hidden");
+    document.getElementById("voteYes").classList.remove("picked");
+    document.getElementById("voteNo").classList.remove("picked");
+    document.getElementById("argText").value = "";
+
+    updateScore(d.yes_count||0, d.no_count||0);
+    loadFeed(d.id);
+
+    // Timer
+    updateTimer(ROUND_SEC);
+    timerInt = setInterval(()=>{
+      timerVal--;
+      updateTimer(timerVal);
+      if(timerVal <= 0){ clearInterval(timerInt); nextDebate(); }
+    }, 1000);
+
+    // Poll feed every 8s
+    pollInt = setInterval(()=>loadFeed(d.id), 8000);
+  }
+
+  function updateTimer(sec) {
+    const pct    = sec / ROUND_SEC;
+    const offset = CIRCUM * (1 - pct);
+    const arc    = document.getElementById("timerArc");
+    arc.style.strokeDashoffset = offset;
+    arc.style.stroke = sec > 20 ? "var(--accent)" : sec > 10 ? "#f59e0b" : "#ef4444";
+    document.getElementById("timerN").textContent = sec;
+  }
+
+  function updateScore(yes, no) {
+    const total = yes + no || 1;
+    const yp    = Math.round(yes/total*100);
+    document.getElementById("scoreYes").textContent = yes + " YES";
+    document.getElementById("scoreNo").textContent  = "NO " + no;
+    document.getElementById("scoreFill").style.width = yp+"%";
+  }
+
+  async function loadFeed(debateId) {
+    const msgs = await api("/debate/"+debateId+"/messages?sort=new&limit=30");
+    if(!msgs || !msgs.length) return;
+    const d = debates[curIdx];
+    if(d.id !== debateId) return; // navigated away
+    // update counts
+    const yes = msgs.filter(m=>m.side==="YES").length;
+    const no  = msgs.filter(m=>m.side==="NO").length;
+    // Get full yes/no from debate data
+    const dr = await api("/api/debates");
+    if(dr){ const cur=dr.find(x=>x.id===debateId); if(cur) updateScore(cur.yes_count||0,cur.no_count||0); }
+
+    document.getElementById("feedCount").textContent = msgs.length+" argument"+(msgs.length!==1?"s":"");
+    document.getElementById("feedList").innerHTML = msgs.map(m=>
+      '<div class="feed-item">' +
+        '<div class="feed-item-head">' +
+          '<span class="feed-pill '+m.side.toLowerCase()+'">'+m.side+'</span>' +
+          '<span class="feed-author">'+esc(m.username)+'</span>' +
+          '<span style="margin-left:auto;font-size:10px;color:var(--muted)">'+
+            (m.score>0?'+':'')+m.score+' pts</span>' +
+        '</div>' +
+        '<div class="feed-text">'+esc(m.text)+'</div>' +
+      '</div>'
+    ).join("");
+  }
+
+  async function castVote(side) {
+    if(!me){ document.getElementById("loginOverlay").classList.remove("hidden"); return; }
+    pickedSide = side;
+    document.getElementById("voteYes").classList.toggle("picked", side==="YES");
+    document.getElementById("voteNo").classList.toggle("picked",  side==="NO");
+    document.getElementById("argForm").classList.remove("hidden");
+    document.getElementById("argText").focus();
+  }
+
+  async function postArg() {
+    if(!me || !pickedSide) return;
+    const text = document.getElementById("argText").value.trim();
+    if(!text) return;
+    const d = debates[curIdx];
+    const r = await api("/debate/"+d.id+"/messages",{method:"POST",body:JSON.stringify({text,side:pickedSide})});
+    if(r?.error){ alert(r.error); return; }
+    document.getElementById("argText").value = "";
+    document.getElementById("argForm").classList.add("hidden");
+    await loadFeed(d.id);
+  }
+
+  document.getElementById("argText").addEventListener("input", function(){
+    document.getElementById("argHint").textContent = this.value.length+" / 300";
+  });
+
+  async function quickJoin() {
+    const username = document.getElementById("liveUser").value.trim();
+    if(!username) return;
+    const r = await api("/auth/login",{method:"POST",body:JSON.stringify({username})});
+    if(r?.error){ alert(r.error); return; }
+    me = r.user;
+    document.getElementById("loginOverlay").classList.add("hidden");
+    document.getElementById("navRight").innerHTML =
+      '<a href="/u/'+esc(me.username)+'" style="font-weight:600;color:var(--text)">'+esc(me.username)+'</a>';
+    if(pickedSide) document.getElementById("argForm").classList.remove("hidden");
+  }
+
+  function nextDebate() {
+    loadDebate(curIdx + 1);
+  }
+
+  init();
 </script>
 </body></html>`;
 }
