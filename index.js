@@ -489,6 +489,26 @@ app.delete("/admin/messages/:id", requireAdmin, wrap(async (req, res) => {
   res.json({ success: true });
 }));
 
+app.delete("/admin/users/:username", requireAdmin, wrap(async (req, res) => {
+  const username = req.params.username;
+  const user = await pool.query("SELECT id FROM users WHERE username=$1", [username]);
+  if (!user.rows[0]) return res.status(404).json({ error: "User not found" });
+  const uid = user.rows[0].id;
+  await pool.query("DELETE FROM votes    WHERE user_id=$1", [uid]);
+  await pool.query("DELETE FROM reactions WHERE user_id=$1", [uid]);
+  await pool.query("DELETE FROM messages WHERE user_id=$1", [uid]);
+  await pool.query("DELETE FROM users    WHERE id=$1",      [uid]);
+  res.json({ success: true });
+}));
+
+app.patch("/admin/users/:username/rating", requireAdmin, wrap(async (req, res) => {
+  const username = req.params.username;
+  const rating   = parseInt(req.body?.rating ?? 0, 10);
+  if (!Number.isFinite(rating)) return res.status(400).json({ error: "Bad rating" });
+  await pool.query("UPDATE users SET rating=$1 WHERE username=$2", [rating, username]);
+  res.json({ success: true });
+}));
+
 app.get("/admin/api/stats", requireAdmin, wrap(async (req, res) => {
   const [debates, users, messages, views, daily, topDebates, recentUsers] = await Promise.all([
     pool.query("SELECT COUNT(*)::int AS count FROM debates WHERE active=TRUE"),
@@ -502,7 +522,7 @@ app.get("/admin/api/stats", requireAdmin, wrap(async (req, res) => {
       GROUP BY day ORDER BY day DESC
     `),
     pool.query(`
-      SELECT d.id, d.question, d.category, d.active,
+      SELECT d.id, d.question, d.category, d.type, d.active,
              COUNT(m.id)::int AS arg_count,
              COALESCE(SUM(pv.cnt),0)::int AS views
       FROM debates d
@@ -526,7 +546,7 @@ app.get("/admin/api/stats", requireAdmin, wrap(async (req, res) => {
     messages:     messages.rows[0].count,
     total_views:  views.rows[0].total,
     unique_visitors: views.rows[0].unique_visitors,
-    daily,
+    daily:           daily.rows,
     top_debates:  topDebates.rows,
     recent_users: recentUsers.rows,
   });
@@ -801,6 +821,13 @@ function landingPage() {
     </div>
   </div>
 
+  <!-- QUICK TAKE -->
+  <div class="section" style="padding-top:0">
+    <div class="section-label">Quick take</div>
+    <h2>What do <em style="font-style:normal;color:var(--accent)">you</em> think?</h2>
+    <div id="quickWidget" style="max-width:580px;margin:0 auto;background:var(--bg2);border:1px solid var(--border);border-radius:24px;padding:28px;"></div>
+  </div>
+
   <!-- CTA -->
   <div class="cta-bottom">
     <h2>Ready to argue?</h2>
@@ -813,13 +840,11 @@ function landingPage() {
   <span>ARGU. — Where the world debates</span>
   &nbsp;·&nbsp;
   <a href="/explore" style="color:var(--muted2)">Debates</a>
-  &nbsp;·&nbsp;
-  <a href="/admin" style="color:var(--muted2)">Admin</a>
 </footer>
 
 <script>
   function esc(s){return String(s).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");}
-  async function api(url){try{const r=await fetch(url);return r.json();}catch{return null;}}
+  async function api(url,opts={}){try{const r=await fetch(url,{headers:{"content-type":"application/json"},...opts});return r.json();}catch{return null;}}
 
   async function loadNav(){
     const d = await api("/me");
@@ -832,9 +857,12 @@ function landingPage() {
     }
   }
 
+  let quickDebate = null, quickSide = null;
+
   async function loadStats(){
     const debates = await api("/api/debates");
-    if(!debates) return;
+    if(!debates || !debates.length) return;
+
     const totalArgs = debates.reduce((s,d)=>s+(d.arg_count||0),0);
     const nums = document.querySelectorAll(".stat-big-n");
     nums[0].textContent = debates.length;
@@ -860,6 +888,98 @@ function landingPage() {
         <div class="preview-bar"><div class="preview-yes" style="width:\${yp}%"></div></div>
       </a>\`;
     }).join("");
+
+    // Quick take — pick a random debate
+    quickDebate = debates[Math.floor(Math.random()*debates.length)];
+    renderQuick("pick");
+  }
+
+  function renderQuick(step){
+    const w = document.getElementById("quickWidget");
+    const d = quickDebate;
+    if(!d){ w.innerHTML=''; return; }
+    const total = d.yes_count+d.no_count;
+    const yp = total>0?Math.round(d.yes_count/total*100):50;
+
+    if(step==="pick"){
+      w.innerHTML=\`
+        <div style="font-family:'Unbounded',sans-serif;font-size:16px;font-weight:700;line-height:1.3;margin-bottom:22px;letter-spacing:-0.01em">\${esc(d.question)}</div>
+        <div style="display:flex;gap:10px;margin-bottom:14px;">
+          <button onclick="pickSide('YES')" style="flex:1;padding:14px;border-radius:14px;border:2px solid rgba(59,130,246,.35);background:var(--yes-dim);color:var(--yes);font-family:'Unbounded',sans-serif;font-size:13px;font-weight:700;cursor:pointer;transition:all .15s;" onmouseover="this.style.borderColor='var(--yes)'" onmouseout="this.style.borderColor='rgba(59,130,246,.35)'">✓ YES</button>
+          <button onclick="pickSide('NO')" style="flex:1;padding:14px;border-radius:14px;border:2px solid rgba(239,68,68,.35);background:var(--no-dim);color:var(--no);font-family:'Unbounded',sans-serif;font-size:13px;font-weight:700;cursor:pointer;transition:all .15s;" onmouseover="this.style.borderColor='var(--no)'" onmouseout="this.style.borderColor='rgba(239,68,68,.35)'">✗ NO</button>
+        </div>
+        <div style="font-size:11px;color:var(--muted);text-align:center">${(total||0).toLocaleString()} people have weighed in · <a href="/debate/\${d.id}" style="color:var(--accent)">See all arguments →</a></div>
+      \`;
+    } else if(step==="write"){
+      const sc = quickSide==="YES"?"var(--yes)":"var(--no)";
+      const bg = quickSide==="YES"?"var(--yes-dim)":"var(--no-dim)";
+      w.innerHTML=\`
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
+          <span style="font-size:10px;font-weight:700;letter-spacing:.1em;background:\${bg};color:\${sc};padding:3px 10px;border-radius:999px">\${quickSide}</span>
+          <span style="font-family:'Unbounded',sans-serif;font-size:14px;font-weight:700;letter-spacing:-0.01em">\${esc(d.question)}</span>
+        </div>
+        <textarea id="quickText" placeholder="Make your case in a sentence or two…" maxlength="300"
+          style="width:100%;min-height:80px;padding:12px 14px;border-radius:10px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-family:'Manrope',sans-serif;font-size:14px;resize:none;outline:none;margin-bottom:10px;"
+          oninput="document.getElementById('qHint').textContent=this.value.length+' / 300'"></textarea>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span id="qHint" style="font-size:11px;color:var(--muted)">0 / 300</span>
+          <div style="display:flex;gap:8px">
+            <button onclick="renderQuick('pick')" style="padding:9px 16px;border-radius:10px;border:1px solid var(--border);background:transparent;color:var(--muted2);font-size:12px;cursor:pointer">← Back</button>
+            <button onclick="submitQuick()" style="padding:9px 20px;border-radius:10px;border:none;background:var(--accent);color:#fff;font-family:'Unbounded',sans-serif;font-size:11px;font-weight:700;cursor:pointer;">Post argument →</button>
+          </div>
+        </div>
+      \`;
+    } else if(step==="done"){
+      w.innerHTML=\`
+        <div style="text-align:center;padding:12px 0">
+          <div style="font-size:28px;margin-bottom:12px">🔥</div>
+          <div style="font-family:'Unbounded',sans-serif;font-size:16px;font-weight:700;margin-bottom:8px">Argument posted!</div>
+          <div style="font-size:13px;color:var(--muted2);margin-bottom:20px">Others are already voting. See how you stack up.</div>
+          <a href="/debate/\${d.id}" style="display:inline-block;padding:11px 24px;border-radius:12px;background:var(--accent);color:#fff;font-family:'Unbounded',sans-serif;font-size:11px;font-weight:700">See the full debate →</a>
+        </div>
+      \`;
+    } else if(step==="login"){
+      w.innerHTML=\`
+        <div style="margin-bottom:14px">
+          <div style="font-size:11px;color:var(--muted);margin-bottom:6px">You picked <strong style="color:\${quickSide==='YES'?'var(--yes)':'var(--no)'}">\${quickSide}</strong>. Choose how to post:</div>
+        </div>
+        <a href="/auth/google" style="display:flex;align-items:center;justify-content:center;gap:8px;padding:12px;border-radius:12px;border:1px solid var(--border2);background:var(--bg3);color:var(--text);font-size:13px;font-weight:600;text-decoration:none;margin-bottom:10px;">
+          <svg width="16" height="16" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+          Continue with Google
+        </a>
+        <div style="text-align:center;font-size:11px;color:var(--muted);margin-bottom:8px">or just pick a username</div>
+        <div style="display:flex;gap:8px">
+          <input id="quickUser" placeholder="username…" maxlength="20" style="flex:1;padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-size:13px;outline:none;"/>
+          <button onclick="quickLogin()" style="padding:10px 18px;border-radius:10px;border:none;background:var(--accent);color:#fff;font-family:'Unbounded',sans-serif;font-size:11px;font-weight:700;cursor:pointer;">Join & Post</button>
+        </div>
+      \`;
+    }
+  }
+
+  function pickSide(side){
+    quickSide = side;
+    // check if already logged in
+    api("/me").then(d=>{
+      if(d?.user) renderQuick("write");
+      else renderQuick("login");
+    });
+  }
+
+  async function quickLogin(){
+    const username = document.getElementById("quickUser").value.trim();
+    if(!username) return;
+    const r = await api("/auth/login",{method:"POST",body:JSON.stringify({username})});
+    if(r?.error) return alert(r.error);
+    renderQuick("write");
+    loadNav();
+  }
+
+  async function submitQuick(){
+    const text = document.getElementById("quickText").value.trim();
+    if(!text) return;
+    const r = await api("/debate/"+quickDebate.id+"/messages",{method:"POST",body:JSON.stringify({text,side:quickSide})});
+    if(r?.error) return alert(r.error);
+    renderQuick("done");
   }
 
   loadNav(); loadStats();
@@ -1885,14 +2005,19 @@ function adminPage() {
     const rows = allUsers.map(u =>
       '<tr>' +
       '<td><a href="/u/'+esc(u.username)+'" style="font-weight:600">'+esc(u.username)+'</a></td>' +
-      '<td style="color:var(--gold);font-weight:700">'+u.rating+'</td>' +
+      '<td><input type="number" value="'+u.rating+'" id="rat-'+esc(u.username)+'" style="width:70px;padding:4px 8px;border-radius:7px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-size:13px;text-align:center"/></td>' +
       '<td>'+(u.arg_count||0)+'</td>' +
       '<td style="color:var(--muted)">'+(u.created_at ? new Date(u.created_at).toLocaleDateString() : "—")+'</td>' +
+      '<td><div style="display:flex;gap:5px">' +
+        '<button class="btn-sm btn-edit" onclick="saveRating(\''+esc(u.username)+'\')">Save rating</button>' +
+        '<button class="btn-sm btn-danger" onclick="delUser(\''+esc(u.username)+'\')">Delete</button>' +
+      '</div></td>' +
       '</tr>'
     ).join("");
     document.getElementById("usersTable").innerHTML =
-      '<table class="table"><thead><tr><th>Username</th><th>Rating</th><th>Arguments</th><th>Joined</th></tr></thead>' +
-      '<tbody>'+rows+'</tbody></table>';
+      '<table class="table"><thead><tr>' +
+      '<th>Username</th><th>Rating</th><th>Arguments</th><th>Joined</th><th>Actions</th>' +
+      '</tr></thead><tbody>'+rows+'</tbody></table>';
   }
 
   // ── Load arguments inline
@@ -1920,6 +2045,21 @@ function adminPage() {
         '</div>' +
       '</div>'
     ).join("");
+  }
+
+  async function saveRating(username) {
+    const val = parseInt(document.getElementById("rat-"+username).value, 10);
+    if(!Number.isFinite(val)) return alert("Enter a valid number");
+    const r = await api("/admin/users/"+encodeURIComponent(username)+"/rating",
+      {method:"PATCH", body:JSON.stringify({rating:val})});
+    if(r.error) return alert(r.error);
+    await loadAll();
+  }
+  async function delUser(username) {
+    if(!confirm('Delete user "'+username+'" and ALL their arguments and votes? Cannot be undone.')) return;
+    const r = await api("/admin/users/"+encodeURIComponent(username), {method:"DELETE"});
+    if(r.error) return alert(r.error);
+    await loadAll();
   }
 
   // ── Actions
