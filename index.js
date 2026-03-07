@@ -908,7 +908,7 @@ function landingPage() {
           <button onclick="pickSide('YES')" style="flex:1;padding:14px;border-radius:14px;border:2px solid rgba(59,130,246,.35);background:var(--yes-dim);color:var(--yes);font-family:'Unbounded',sans-serif;font-size:13px;font-weight:700;cursor:pointer;transition:all .15s;" onmouseover="this.style.borderColor='var(--yes)'" onmouseout="this.style.borderColor='rgba(59,130,246,.35)'">✓ YES</button>
           <button onclick="pickSide('NO')" style="flex:1;padding:14px;border-radius:14px;border:2px solid rgba(239,68,68,.35);background:var(--no-dim);color:var(--no);font-family:'Unbounded',sans-serif;font-size:13px;font-weight:700;cursor:pointer;transition:all .15s;" onmouseover="this.style.borderColor='var(--no)'" onmouseout="this.style.borderColor='rgba(239,68,68,.35)'">✗ NO</button>
         </div>
-        <div style="font-size:11px;color:var(--muted);text-align:center">${(total||0).toLocaleString()} people have weighed in · <a href="/debate/\${d.id}" style="color:var(--accent)">See all arguments →</a></div>
+        <div style="font-size:11px;color:var(--muted);text-align:center">\${(total||0).toLocaleString()} people have weighed in · <a href="/debate/\${d.id}" style="color:var(--accent)">See all arguments →</a></div>
       \`;
     } else if(step==="write"){
       const sc = quickSide==="YES"?"var(--yes)":"var(--no)";
