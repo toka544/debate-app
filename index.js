@@ -504,66 +504,6 @@ app.patch("/admin/users/:username/rating", requireAdmin, wrap(async (req, res) =
   res.json({ success: true });
 }));
 
-app.get("/admin/api/stats", requireAdmin, wrap(async (req, res) => {
-  const [debates, users, messages, views, daily, topDebates, recentUsers] = await Promise.all([
-    pool.query("SELECT COUNT(*)::int AS count FROM debates WHERE active=TRUE"),
-    pool.query("SELECT COUNT(*)::int AS count FROM users"),
-    pool.query("SELECT COUNT(*)::int AS count FROM messages"),
-    pool.query("SELECT COUNT(*)::int AS total, COUNT(DISTINCT visitor_id)::int AS unique_visitors FROM page_views"),
-    pool.query(`
-      SELECT DATE(created_at) AS day, COUNT(*)::int AS views, COUNT(DISTINCT visitor_id)::int AS uniq
-      FROM page_views
-      WHERE created_at > NOW() - INTERVAL '14 days'
-      GROUP BY day ORDER BY day DESC
-    `),
-    pool.query(`
-      SELECT d.id, d.question, d.category, d.type, d.active,
-             COUNT(m.id)::int AS arg_count,
-             COALESCE(SUM(pv.cnt),0)::int AS views
-      FROM debates d
-      LEFT JOIN messages m ON m.debate_id = d.id
-      LEFT JOIN (
-        SELECT path, COUNT(*)::int AS cnt FROM page_views GROUP BY path
-      ) pv ON pv.path = '/debate/' || d.id
-      GROUP BY d.id
-      ORDER BY d.id ASC
-    `),
-    pool.query(`
-      SELECT username, rating, created_at,
-             (SELECT COUNT(*)::int FROM messages WHERE user_id=users.id) AS arg_count
-      FROM users ORDER BY created_at DESC LIMIT 20
-    `),
-  ]);
-
-  res.json({
-    debates:      debates.rows[0].count,
-    users:        users.rows[0].count,
-    messages:     messages.rows[0].count,
-    total_views:  views.rows[0].total,
-    unique_visitors: views.rows[0].unique_visitors,
-    daily:           daily.rows,
-    top_debates:  topDebates.rows,
-    recent_users: recentUsers.rows,
-  });
-}));
-
-// ─────────────────────────────────────────────────────────
-// HTML Pages
-// ─────────────────────────────────────────────────────────
-app.get("/", wrap(async (req, res) => {
-  trackView(req, res, "/");
-  res.type("html").send(landingPage());
-}));
-
-app.get("/explore", wrap(async (req, res) => {
-  trackView(req, res, "/explore");
-  res.type("html").send(explorePage());
-}));
-
-app.get("/live", wrap(async (req, res) => {
-  res.type("html").send(livePage());
-}));
-
 // ── Server-side live debate clock
 // Phases: READ=15s, ARGUE=60s, VOTE=45s → total 120s per debate
 const LIVE_PHASES = [
@@ -630,30 +570,6 @@ app.get("/api/live-state", wrap(async (req, res) => {
     duration:  phase.duration,
   });
 }));
-
-app.get("/debate", (req, res) => res.redirect("/explore"));
-
-app.get("/debate/:id", wrap(async (req, res) => {
-  const debateId = parseInt(req.params.id, 10);
-  const r = await pool.query(
-    "SELECT id, question, category FROM debates WHERE id=$1 AND active=TRUE",
-    [debateId]
-  );
-  const debate = r.rows[0];
-  if (!debate) return res.status(404).type("text").send("Debate not found");
-  trackView(req, res, `/debate/${debateId}`);
-  res.type("html").send(debatePage(debateId, debate.question, debate.category));
-}));
-
-app.get("/u/:username", wrap(async (req, res) => {
-  res.type("html").send(profilePage(req.params.username));
-}));
-
-app.get("/admin", (req, res) => {
-  if (req.cookies?.admin_session !== ADMIN_PASSWORD)
-    return res.type("html").send(adminLoginPage(""));
-  res.type("html").send(adminPage());
-});
 
 // ─────────────────────────────────────────────────────────
 // Error handler
@@ -796,12 +712,27 @@ function toast(msg,type){
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function ago(ts){var s=Math.floor((Date.now()-new Date(ts))/1000);if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago';}
 function badge(r){if(r>=500)return'💎';if(r>=200)return'🥇';if(r>=100)return'🥈';if(r>=25)return'🥉';return'';}
-async function api(url,opts){
+async function api(url,opts,ms){
+  ms=ms||18000;
+  var ctrl=new AbortController();
+  var tid=setTimeout(function(){ctrl.abort();},ms);
   try{
-    var r=await fetch(url,Object.assign({credentials:'same-origin',headers:{'content-type':'application/json'}},opts||{}));
+    var r=await fetch(url,Object.assign({credentials:'same-origin',headers:{'content-type':'application/json'},signal:ctrl.signal},opts||{}));
+    clearTimeout(tid);
     var t=await r.text();
     try{return JSON.parse(t);}catch(e){return{error:'Parse error'};}
-  }catch(e){return null;}
+  }catch(e){
+    clearTimeout(tid);
+    if(e.name==='AbortError'){
+      // Retry once after cold start
+      try{
+        var r2=await fetch(url,Object.assign({credentials:'same-origin',headers:{'content-type':'application/json'}},opts||{}));
+        var t2=await r2.text();
+        try{return JSON.parse(t2);}catch(e2){return{error:'Parse error'};}
+      }catch(e3){return null;}
+    }
+    return null;
+  }
 }
 function toggleTheme(){
   var isL=document.documentElement.getAttribute('data-theme')==='light';
