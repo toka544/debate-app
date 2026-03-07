@@ -70,9 +70,10 @@ CREATE TABLE IF NOT EXISTS page_views (
 -- ─────────────────────────────────────────
 -- SAFE ALTER for old deployments
 -- ─────────────────────────────────────────
-ALTER TABLE votes   ADD COLUMN IF NOT EXISTS weight  INT     NOT NULL DEFAULT 1;
-ALTER TABLE debates ADD COLUMN IF NOT EXISTS category TEXT   NOT NULL DEFAULT 'General';
+ALTER TABLE votes   ADD COLUMN IF NOT EXISTS weight   INT     NOT NULL DEFAULT 1;
+ALTER TABLE debates ADD COLUMN IF NOT EXISTS category TEXT    NOT NULL DEFAULT 'General';
 ALTER TABLE debates ADD COLUMN IF NOT EXISTS active   BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE debates ADD COLUMN IF NOT EXISTS type     TEXT    NOT NULL DEFAULT 'question';
 
 -- ─────────────────────────────────────────
 -- INDEXES
@@ -90,7 +91,7 @@ CREATE INDEX IF NOT EXISTS idx_page_views_path      ON page_views(path, created_
 -- ─────────────────────────────────────────
 DO $$
 BEGIN
-  IF (SELECT COUNT(*) FROM debates) < 2 THEN
+  IF (SELECT COUNT(*) FROM debates) = 0 THEN
     INSERT INTO debates (question, category) VALUES
       ('Is college a scam?',                              'Education'),
       ('Should billionaires exist?',                      'Economy'),

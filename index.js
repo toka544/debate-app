@@ -204,7 +204,7 @@ app.get("/auth/google/callback", wrap(async (req, res) => {
 // ─────────────────────────────────────────────────────────
 app.get("/api/debates", wrap(async (req, res) => {
   const r = await pool.query(`
-    SELECT d.id, d.question, d.category,
+    SELECT d.id, d.question, d.category, d.type,
            COUNT(m.id)::int                                AS arg_count,
            COUNT(CASE WHEN m.side='YES' THEN 1 END)::int   AS yes_count,
            COUNT(CASE WHEN m.side='NO'  THEN 1 END)::int   AS no_count
@@ -212,7 +212,7 @@ app.get("/api/debates", wrap(async (req, res) => {
     LEFT   JOIN messages m ON m.debate_id = d.id
     WHERE  d.active = TRUE
     GROUP  BY d.id
-    ORDER  BY d.id ASC
+    ORDER  BY d.id DESC
   `);
   res.json(r.rows);
 }));
@@ -433,10 +433,11 @@ app.post("/admin/logout", (req, res) => {
 app.post("/admin/debates", requireAdmin, wrap(async (req, res) => {
   const question = (req.body?.question || "").trim();
   const category = (req.body?.category || "General").trim();
+  const type     = req.body?.type === "event" ? "event" : "question";
   if (!question) return res.status(400).json({ error: "Question required" });
   await pool.query(
-    "INSERT INTO debates (question, category) VALUES ($1, $2)",
-    [question, category]
+    "INSERT INTO debates (question, category, type) VALUES ($1, $2, $3)",
+    [question, category, type]
   );
   res.json({ success: true });
 }));
@@ -453,6 +454,32 @@ app.post("/admin/debates/:id/toggle", requireAdmin, wrap(async (req, res) => {
 app.delete("/admin/debates/:id", requireAdmin, wrap(async (req, res) => {
   const id = parseInt(req.params.id, 10);
   await pool.query("DELETE FROM debates WHERE id=$1", [id]);
+  res.json({ success: true });
+}));
+
+app.patch("/admin/debates/:id", requireAdmin, wrap(async (req, res) => {
+  const id       = parseInt(req.params.id, 10);
+  const question = (req.body?.question || "").trim();
+  const category = (req.body?.category || "").trim();
+  const type     = req.body?.type === "event" ? "event" : "question";
+  if (!question || !category) return res.status(400).json({ error: "question and category required" });
+  await pool.query(
+    "UPDATE debates SET question=$1, category=$2, type=$3 WHERE id=$4",
+    [question, category, type, id]
+  );
+  res.json({ success: true });
+}));
+
+// Delete entire category (moves debates to General first, or deletes all)
+app.delete("/admin/category/:name", requireAdmin, wrap(async (req, res) => {
+  const name   = decodeURIComponent(req.params.name);
+  const action = req.body?.action || "move";
+  const target = (req.body?.target || "General").trim();
+  if (action === "delete") {
+    await pool.query("DELETE FROM debates WHERE category=$1", [name]);
+  } else {
+    await pool.query("UPDATE debates SET category=$1 WHERE category=$2", [target, name]);
+  }
   res.json({ success: true });
 }));
 
@@ -510,10 +537,15 @@ app.get("/admin/api/stats", requireAdmin, wrap(async (req, res) => {
 // ─────────────────────────────────────────────────────────
 app.get("/", wrap(async (req, res) => {
   trackView(req, res, "/");
-  res.type("html").send(homePage());
+  res.type("html").send(landingPage());
 }));
 
-app.get("/debate", (req, res) => res.redirect("/"));
+app.get("/explore", wrap(async (req, res) => {
+  trackView(req, res, "/explore");
+  res.type("html").send(explorePage());
+}));
+
+app.get("/debate", (req, res) => res.redirect("/explore"));
 
 app.get("/debate/:id", wrap(async (req, res) => {
   const debateId = parseInt(req.params.id, 10);
@@ -545,9 +577,6 @@ app.use((err, req, res, _next) => {
   res.status(500).json({ error: "Internal server error" });
 });
 
-// ─────────────────────────────────────────────────────────
-// Shared CSS
-// ─────────────────────────────────────────────────────────
 const BASE_CSS = `
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@400;600;700;900&family=Manrope:wght@300;400;500;600&display=swap" rel="stylesheet"/>
@@ -598,47 +627,295 @@ const BASE_CSS = `
 `;
 
 // ─────────────────────────────────────────────────────────
-// HOME PAGE
+// LANDING PAGE (/)
 // ─────────────────────────────────────────────────────────
-function homePage() {
+function landingPage() {
   return `<!doctype html><html lang="en">
 <head>
   <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>ARGU — Live Debates</title>
+  <title>ARGU — Where the world debates</title>
+  <meta name="description" content="Pick a side. Make your case. Let the world decide. Real debates on the events and questions that define our time."/>
   ${BASE_CSS}
   <style>
-    .page { max-width: 1100px; margin: 0 auto; padding: 48px 24px 80px; position: relative; z-index: 1; }
-    .hero-home { text-align: center; padding: 16px 0 48px; }
-    .hero-home h1 { font-family: 'Unbounded', sans-serif; font-size: clamp(30px,5vw,56px); font-weight: 900; letter-spacing: -0.03em; line-height: 1.08; margin-bottom: 14px; }
-    .hero-home h1 span { color: var(--accent); }
-    .hero-home p { font-size: 15px; color: var(--muted2); max-width: 420px; margin: 0 auto 28px; }
-    .auth-bar { display: flex; align-items: center; justify-content: center; gap: 10px; flex-wrap: wrap; }
-    .auth-input { padding: 11px 16px; border-radius: 12px; border: 1px solid var(--border); background: var(--bg2); color: var(--text); font-family: 'Manrope', sans-serif; font-size: 14px; width: 210px; outline: none; transition: border-color .18s; }
-    .auth-input:focus { border-color: rgba(59,130,246,0.5); }
-    .auth-input::placeholder { color: var(--muted); }
-    .btn-out { padding: 10px 18px; border-radius: 12px; border: 1px solid var(--border); background: var(--bg2); color: var(--muted2); font-size: 13px; cursor: pointer; transition: all .15s; }
-    .btn-out:hover { border-color: var(--border2); color: var(--text); }
-    .filter-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 24px; }
-    .filter-btn { padding: 7px 16px; border-radius: 999px; font-size: 12px; font-weight: 600; border: 1px solid var(--border); background: transparent; color: var(--muted2); cursor: pointer; transition: all .15s; }
-    .filter-btn:hover, .filter-btn.on { background: var(--bg3); border-color: var(--border2); color: var(--text); }
-    .debates-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
-    .debate-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 18px; padding: 22px; display: flex; flex-direction: column; gap: 11px; cursor: pointer; transition: border-color .2s, transform .18s; }
-    .debate-card:hover { border-color: var(--border2); transform: translateY(-2px); }
-    .cat-tag { font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--accent); background: var(--yes-dim); border: 1px solid rgba(59,130,246,.2); padding: 3px 9px; border-radius: 999px; }
-    .arg-count { font-size: 11px; color: var(--muted); }
-    .debate-q { font-family: 'Unbounded', sans-serif; font-size: 14px; font-weight: 700; line-height: 1.3; letter-spacing: -0.01em; flex: 1; }
-    .vote-bar { height: 4px; background: var(--bg3); border-radius: 999px; overflow: hidden; }
-    .bar-yes { height: 100%; background: var(--yes); transition: width .4s ease; float: left; }
-    .bar-no  { height: 100%; background: var(--no);  float: right; }
-    .vote-nums { display: flex; justify-content: space-between; font-size: 11px; }
-    .vote-yes { color: var(--yes); font-weight: 700; }
-    .vote-no  { color: var(--no);  font-weight: 700; }
-    .open-btn { padding: 9px; border-radius: 10px; text-align: center; background: var(--bg3); border: 1px solid var(--border); font-size: 12px; font-weight: 600; color: var(--muted2); transition: all .15s; }
-    .debate-card:hover .open-btn { background: var(--accent); border-color: var(--accent); color: #fff; }
-    .stats-bar { display: flex; gap: 24px; justify-content: center; margin-bottom: 36px; flex-wrap: wrap; }
-    .stat-item { text-align: center; }
-    .stat-num { font-family: 'Unbounded', sans-serif; font-size: 22px; font-weight: 900; color: var(--text); }
-    .stat-lbl { font-size: 11px; color: var(--muted); margin-top: 2px; }
+    .page{max-width:1100px;margin:0 auto;padding:0 24px;position:relative;z-index:1;}
+
+    /* NAV CTA */
+    .nav-cta{display:flex;align-items:center;gap:10px;}
+    .nav-link{font-size:13px;color:var(--muted2);transition:color .15s;padding:4px 8px;}
+    .nav-link:hover{color:var(--text);}
+    .nav-btn{padding:8px 18px;border-radius:10px;background:var(--accent);color:#fff;font-family:'Unbounded',sans-serif;font-size:11px;font-weight:700;letter-spacing:.04em;border:none;cursor:pointer;text-decoration:none;transition:opacity .15s;}
+    .nav-btn:hover{opacity:.85;}
+
+    /* HERO */
+    .hero{min-height:88vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:60px 0 40px;}
+    .hero-eyebrow{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);border:1px solid rgba(59,130,246,.3);background:rgba(59,130,246,.07);padding:5px 14px;border-radius:999px;margin-bottom:28px;}
+    .live-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);animation:blink 1.4s infinite;}
+    @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
+    .hero h1{font-family:'Unbounded',sans-serif;font-size:clamp(36px,6vw,76px);font-weight:900;letter-spacing:-0.04em;line-height:1.02;margin-bottom:22px;}
+    .hero h1 .yes{color:var(--yes);}
+    .hero h1 .no{color:var(--no);}
+    .hero-sub{font-size:clamp(15px,2vw,19px);color:var(--muted2);max-width:560px;line-height:1.6;margin-bottom:36px;}
+    .hero-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:center;}
+    .btn-big{padding:14px 30px;border-radius:14px;font-family:'Unbounded',sans-serif;font-size:12px;font-weight:700;letter-spacing:.04em;cursor:pointer;transition:all .18s;text-decoration:none;}
+    .btn-big-primary{background:var(--accent);color:#fff;border:none;}
+    .btn-big-primary:hover{opacity:.88;transform:translateY(-1px);}
+    .btn-big-outline{background:transparent;color:var(--text);border:1px solid var(--border2);}
+    .btn-big-outline:hover{background:var(--bg2);}
+
+    /* LIVE TICKER */
+    .ticker{background:var(--bg2);border-top:1px solid var(--border);border-bottom:1px solid var(--border);padding:12px 0;overflow:hidden;margin:0 -24px;}
+    .ticker-inner{display:flex;gap:48px;animation:scroll 30s linear infinite;white-space:nowrap;width:max-content;}
+    .ticker-inner:hover{animation-play-state:paused;}
+    @keyframes scroll{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+    .ticker-item{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--muted2);}
+    .ticker-dot{width:5px;height:5px;border-radius:50%;background:var(--accent);flex-shrink:0;}
+
+    /* HOW IT WORKS */
+    .section{padding:80px 0;}
+    .section-label{font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin-bottom:14px;text-align:center;}
+    .section h2{font-family:'Unbounded',sans-serif;font-size:clamp(22px,3.5vw,38px);font-weight:800;letter-spacing:-0.02em;text-align:center;margin-bottom:48px;line-height:1.15;}
+    .how-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:16px;}
+    .how-card{background:var(--bg2);border:1px solid var(--border);border-radius:20px;padding:28px 24px;}
+    .how-icon{font-size:28px;margin-bottom:14px;}
+    .how-title{font-family:'Unbounded',sans-serif;font-size:14px;font-weight:700;margin-bottom:8px;}
+    .how-desc{font-size:13px;color:var(--muted2);line-height:1.6;}
+
+    /* STATS */
+    .stats-section{background:var(--bg2);border-top:1px solid var(--border);border-bottom:1px solid var(--border);padding:48px 0;margin:0 -24px;}
+    .stats-inner{max-width:800px;margin:0 auto;display:flex;justify-content:center;gap:60px;flex-wrap:wrap;padding:0 24px;}
+    .stat-big{text-align:center;}
+    .stat-big-n{font-family:'Unbounded',sans-serif;font-size:48px;font-weight:900;line-height:1;background:linear-gradient(135deg,var(--text),var(--muted2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+    .stat-big-l{font-size:12px;color:var(--muted);margin-top:6px;letter-spacing:.08em;text-transform:uppercase;}
+
+    /* PREVIEW DEBATES */
+    .preview-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;margin-top:0;}
+    .preview-card{background:var(--bg2);border:1px solid var(--border);border-radius:16px;padding:18px;transition:border-color .18s,transform .18s;text-decoration:none;display:block;}
+    .preview-card:hover{border-color:var(--border2);transform:translateY(-2px);}
+    .preview-type{font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;margin-bottom:8px;}
+    .preview-type.event{color:#f59e0b;}
+    .preview-type.question{color:var(--accent);}
+    .preview-q{font-family:'Unbounded',sans-serif;font-size:13px;font-weight:700;line-height:1.3;margin-bottom:12px;}
+    .preview-bar{height:3px;background:var(--bg3);border-radius:999px;overflow:hidden;}
+    .preview-yes{height:100%;background:var(--yes);}
+
+    /* CTA BOTTOM */
+    .cta-bottom{text-align:center;padding:80px 0 100px;}
+    .cta-bottom h2{font-family:'Unbounded',sans-serif;font-size:clamp(24px,4vw,44px);font-weight:900;letter-spacing:-0.03em;margin-bottom:16px;line-height:1.1;}
+    .cta-bottom p{font-size:16px;color:var(--muted2);margin-bottom:32px;}
+
+    /* FOOTER */
+    footer{border-top:1px solid var(--border);padding:28px 24px;text-align:center;font-size:12px;color:var(--muted);}
+  </style>
+</head>
+<body>
+<nav>
+  <div class="nav-inner">
+    <a class="logo" href="/">ARGU<span>.</span></a>
+    <div class="nav-cta">
+      <a class="nav-link" href="/explore">Debates</a>
+      <div id="navAuth"></div>
+    </div>
+  </div>
+</nav>
+
+<!-- HERO -->
+<div class="page">
+  <div class="hero">
+    <div class="hero-eyebrow"><span class="live-dot"></span>Live debates happening now</div>
+    <h1>The world<br>says <span class="yes">YES</span><br>or <span class="no">NO</span></h1>
+    <p class="hero-sub">Pick a side on the events and questions that define our time. Argue your case. Let the crowd decide who wins.</p>
+    <div class="hero-actions">
+      <a href="/explore" class="btn-big btn-big-primary">Enter the arena →</a>
+      <a href="#how" class="btn-big btn-big-outline">How it works</a>
+    </div>
+  </div>
+</div>
+
+<!-- TICKER -->
+<div class="ticker">
+  <div class="ticker-inner" id="ticker">
+    <span class="ticker-item"><span class="ticker-dot"></span>Is college a scam?</span>
+    <span class="ticker-item"><span class="ticker-dot"></span>Should billionaires exist?</span>
+    <span class="ticker-item"><span class="ticker-dot"></span>Will AI replace programmers?</span>
+    <span class="ticker-item"><span class="ticker-dot"></span>Is democracy failing?</span>
+    <span class="ticker-item"><span class="ticker-dot"></span>Is hustle culture toxic?</span>
+    <span class="ticker-item"><span class="ticker-dot"></span>Should AI have legal rights?</span>
+    <span class="ticker-item"><span class="ticker-dot"></span>Is capitalism broken?</span>
+    <span class="ticker-item"><span class="ticker-dot"></span>Is college a scam?</span>
+    <span class="ticker-item"><span class="ticker-dot"></span>Should billionaires exist?</span>
+    <span class="ticker-item"><span class="ticker-dot"></span>Will AI replace programmers?</span>
+    <span class="ticker-item"><span class="ticker-dot"></span>Is democracy failing?</span>
+    <span class="ticker-item"><span class="ticker-dot"></span>Is hustle culture toxic?</span>
+    <span class="ticker-item"><span class="ticker-dot"></span>Should AI have legal rights?</span>
+    <span class="ticker-item"><span class="ticker-dot"></span>Is capitalism broken?</span>
+  </div>
+</div>
+
+<!-- STATS -->
+<div class="stats-section">
+  <div class="stats-inner" id="statsRow">
+    <div class="stat-big"><div class="stat-big-n">—</div><div class="stat-big-l">Debates</div></div>
+    <div class="stat-big"><div class="stat-big-n">—</div><div class="stat-big-l">Arguments posted</div></div>
+    <div class="stat-big"><div class="stat-big-n">—</div><div class="stat-big-l">Debaters</div></div>
+  </div>
+</div>
+
+<!-- HOW IT WORKS -->
+<div class="page">
+  <div class="section" id="how">
+    <div class="section-label">How it works</div>
+    <h2>Debate like it matters.</h2>
+    <div class="how-grid">
+      <div class="how-card">
+        <div class="how-icon">🌍</div>
+        <div class="how-title">Real events & questions</div>
+        <div class="how-desc">We cover breaking world events and the big philosophical questions that humanity keeps arguing about.</div>
+      </div>
+      <div class="how-card">
+        <div class="how-icon">⚔️</div>
+        <div class="how-title">Pick your side</div>
+        <div class="how-desc">Every debate is binary — YES or NO. No fence-sitting. Make a choice and defend it with your best argument.</div>
+      </div>
+      <div class="how-card">
+        <div class="how-icon">🗳️</div>
+        <div class="how-title">The crowd votes</div>
+        <div class="how-desc">Other users vote on your argument. The better your case, the higher your score — and your rating grows.</div>
+      </div>
+      <div class="how-card">
+        <div class="how-icon">🏆</div>
+        <div class="how-title">Rise the leaderboard</div>
+        <div class="how-desc">The best debaters earn rating points. Make compelling arguments, gain influence, become a top voice.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PREVIEW -->
+  <div class="section" style="padding-top:0">
+    <div class="section-label">Trending now</div>
+    <h2>Jump into a debate</h2>
+    <div class="preview-grid" id="previewGrid">
+      <div style="color:var(--muted);font-size:13px;grid-column:1/-1">Loading debates…</div>
+    </div>
+    <div style="text-align:center;margin-top:28px">
+      <a href="/explore" class="btn-big btn-big-outline">See all debates →</a>
+    </div>
+  </div>
+
+  <!-- CTA -->
+  <div class="cta-bottom">
+    <h2>Ready to argue?</h2>
+    <p>Join thousands of debaters. Your opinion matters.</p>
+    <a href="/explore" class="btn-big btn-big-primary">Start debating →</a>
+  </div>
+</div>
+
+<footer>
+  <span>ARGU. — Where the world debates</span>
+  &nbsp;·&nbsp;
+  <a href="/explore" style="color:var(--muted2)">Debates</a>
+  &nbsp;·&nbsp;
+  <a href="/admin" style="color:var(--muted2)">Admin</a>
+</footer>
+
+<script>
+  function esc(s){return String(s).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");}
+  async function api(url){try{const r=await fetch(url);return r.json();}catch{return null;}}
+
+  async function loadNav(){
+    const d = await api("/me");
+    const me = d?.user;
+    const el = document.getElementById("navAuth");
+    if(!me){
+      el.innerHTML=\`<a href="/explore" class="nav-btn">Join debate</a>\`;
+    } else {
+      el.innerHTML=\`<a href="/u/\${esc(me.username)}" style="font-size:13px;color:var(--muted2);margin-right:4px"><strong style="color:var(--text)">\${esc(me.username)}</strong> ★\${me.rating}</a>\`;
+    }
+  }
+
+  async function loadStats(){
+    const debates = await api("/api/debates");
+    if(!debates) return;
+    const totalArgs = debates.reduce((s,d)=>s+(d.arg_count||0),0);
+    const nums = document.querySelectorAll(".stat-big-n");
+    nums[0].textContent = debates.length;
+    nums[1].textContent = totalArgs;
+
+    const lb = await api("/leaderboard/users?limit=1000");
+    if(lb) nums[2].textContent = lb.length;
+
+    // Preview — show 6 most active
+    const top = [...debates].sort((a,b)=>b.arg_count-a.arg_count).slice(0,6);
+    document.getElementById("previewGrid").innerHTML = top.map(d=>{
+      const total=d.yes_count+d.no_count;
+      const yp=total>0?Math.round(d.yes_count/total*100):50;
+      const typeLabel = d.type==="event" ? "🌍 Event" : "💭 Question";
+      return \`<a class="preview-card" href="/debate/\${d.id}">
+        <div class="preview-type \${d.type||'question'}">\${typeLabel}</div>
+        <div class="preview-q">\${esc(d.question)}</div>
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-bottom:6px">
+          <span style="color:var(--yes);font-weight:700">YES \${yp}%</span>
+          <span>\${d.arg_count} arguments</span>
+          <span style="color:var(--no);font-weight:700">\${100-yp}% NO</span>
+        </div>
+        <div class="preview-bar"><div class="preview-yes" style="width:\${yp}%"></div></div>
+      </a>\`;
+    }).join("");
+  }
+
+  loadNav(); loadStats();
+</script>
+</body></html>`;
+}
+
+// ─────────────────────────────────────────────────────────
+// EXPLORE PAGE (/explore)
+// ─────────────────────────────────────────────────────────
+function explorePage() {
+  return `<!doctype html><html lang="en">
+<head>
+  <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Explore Debates — ARGU</title>
+  ${BASE_CSS}
+  <style>
+    .page{max-width:1200px;margin:0 auto;padding:40px 24px 80px;position:relative;z-index:1;}
+    /* Auth bar */
+    .auth-strip{background:var(--bg2);border:1px solid var(--border);border-radius:14px;padding:16px 20px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:32px;}
+    .auth-input{padding:10px 14px;border-radius:10px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-family:'Manrope',sans-serif;font-size:13px;outline:none;width:180px;transition:border-color .18s;}
+    .auth-input:focus{border-color:rgba(59,130,246,.5);}
+    .auth-input::placeholder{color:var(--muted);}
+    .btn-out{padding:9px 16px;border-radius:10px;border:1px solid var(--border);background:transparent;color:var(--muted2);font-size:13px;cursor:pointer;transition:all .15s;}
+    .btn-out:hover{border-color:var(--border2);color:var(--text);}
+    /* Two columns */
+    .explore-header{margin-bottom:28px;}
+    .explore-header h1{font-family:'Unbounded',sans-serif;font-size:clamp(22px,3vw,32px);font-weight:800;letter-spacing:-0.02em;margin-bottom:6px;}
+    .explore-header p{font-size:14px;color:var(--muted2);}
+    .columns{display:grid;grid-template-columns:1fr 1fr;gap:24px;align-items:start;}
+    @media(max-width:720px){.columns{grid-template-columns:1fr;}}
+    .col-header{display:flex;align-items:center;gap:10px;margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid var(--border);}
+    .col-icon{font-size:20px;}
+    .col-title{font-family:'Unbounded',sans-serif;font-size:14px;font-weight:800;}
+    .col-title.event{color:#f59e0b;}
+    .col-title.question{color:var(--accent);}
+    .col-sub{font-size:11px;color:var(--muted);margin-top:2px;}
+    /* Debate card */
+    .dcard{background:var(--bg2);border:1px solid var(--border);border-radius:16px;padding:18px;margin-bottom:10px;display:flex;flex-direction:column;gap:10px;transition:border-color .18s,transform .16s;text-decoration:none;color:inherit;display:block;}
+    .dcard:hover{border-color:var(--border2);transform:translateY(-1px);}
+    .dcard-top{display:flex;align-items:center;justify-content:space-between;}
+    .cat-tag{font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:3px 8px;border-radius:999px;}
+    .cat-tag.event{color:#f59e0b;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.25);}
+    .cat-tag.question{color:var(--accent);background:var(--yes-dim);border:1px solid rgba(59,130,246,.2);}
+    .arg-ct{font-size:11px;color:var(--muted);}
+    .dcard-q{font-family:'Unbounded',sans-serif;font-size:13px;font-weight:700;line-height:1.3;letter-spacing:-0.01em;}
+    .dcard-bar{height:3px;background:var(--bg3);border-radius:999px;overflow:hidden;}
+    .dcard-yes{height:100%;background:var(--yes);}
+    .dcard-nums{display:flex;justify-content:space-between;font-size:10px;font-weight:700;}
+    .dcard-open{padding:8px;border-radius:8px;text-align:center;background:var(--bg3);border:1px solid var(--border);font-size:11px;font-weight:600;color:var(--muted2);transition:all .15s;}
+    .dcard:hover .dcard-open{background:var(--accent);border-color:var(--accent);color:#fff;}
+    /* Filter */
+    .filter-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:20px;}
+    .filter-btn{padding:6px 14px;border-radius:999px;font-size:11px;font-weight:600;border:1px solid var(--border);background:transparent;color:var(--muted2);cursor:pointer;transition:all .15s;}
+    .filter-btn.on,.filter-btn:hover{background:var(--bg3);border-color:var(--border2);color:var(--text);}
+    .empty-col{text-align:center;padding:40px 20px;color:var(--muted);font-size:13px;background:var(--bg2);border:1px dashed var(--border);border-radius:16px;}
   </style>
 </head>
 <body>
@@ -649,108 +926,132 @@ function homePage() {
   </div>
 </nav>
 <div class="page">
-  <div class="hero-home">
-    <h1>Argue.<br>Vote. <span>Win.</span></h1>
-    <p>Real debates on topics that matter. Pick a side and make your case.</p>
-    <div class="auth-bar" id="authArea">Loading…</div>
+
+  <!-- Auth strip -->
+  <div class="auth-strip" id="authStrip">Loading…</div>
+
+  <div class="explore-header">
+    <h1>The Arena</h1>
+    <p>World events on the left. Timeless questions on the right. Pick a debate and make your case.</p>
   </div>
 
-  <div class="stats-bar" id="statsBar"></div>
-
+  <!-- Category filter -->
   <div class="filter-row" id="filterRow"></div>
-  <div class="debates-grid" id="grid">
-    <div style="color:var(--muted);font-size:14px;grid-column:1/-1;text-align:center;padding:40px">Loading…</div>
+
+  <!-- Two columns -->
+  <div class="columns">
+    <div>
+      <div class="col-header">
+        <span class="col-icon">🌍</span>
+        <div>
+          <div class="col-title event">World Events</div>
+          <div class="col-sub">Breaking topics, current affairs</div>
+        </div>
+      </div>
+      <div id="eventsCol"><div style="color:var(--muted);font-size:13px">Loading…</div></div>
+    </div>
+    <div>
+      <div class="col-header">
+        <span class="col-icon">💭</span>
+        <div>
+          <div class="col-title question">Questions</div>
+          <div class="col-sub">Society, life, the future</div>
+        </div>
+      </div>
+      <div id="questionsCol"><div style="color:var(--muted);font-size:13px">Loading…</div></div>
+    </div>
   </div>
+
 </div>
 <script>
-  let allDebates = [], currentCat = "All";
+  let allDebates=[], currentCat="All";
   function esc(s){return String(s).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");}
   async function api(url,opts={}){const r=await fetch(url,{headers:{"content-type":"application/json"},...opts});return r.json();}
 
-  async function loadMe(){
-    const {user:me} = await api("/me").catch(()=>({user:null}));
-    const navRight = document.getElementById("navRight");
-    const authArea = document.getElementById("authArea");
+  async function loadNav(){
+    const {user:me}=await api("/me").catch(()=>({user:null}));
+    const navRight=document.getElementById("navRight");
+    const strip=document.getElementById("authStrip");
     if(!me){
       navRight.innerHTML='';
-      authArea.innerHTML=\`
-        <a href="/auth/google" style="display:inline-flex;align-items:center;gap:8px;padding:11px 20px;border-radius:12px;border:1px solid var(--border2);background:var(--bg2);color:var(--text);font-size:13px;font-weight:600;text-decoration:none;transition:background .18s;" onmouseover="this.style.background='#1e2028'" onmouseout="this.style.background='var(--bg2)'">
-          <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+      strip.innerHTML=\`
+        <a href="/auth/google" style="display:inline-flex;align-items:center;gap:7px;padding:9px 16px;border-radius:10px;border:1px solid var(--border2);background:var(--bg3);color:var(--text);font-size:13px;font-weight:600;text-decoration:none;">
+          <svg width="15" height="15" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
           Continue with Google
         </a>
-        <span style="font-size:12px;color:var(--muted)">or</span>
-        <input class="auth-input" id="username" placeholder="Just enter a username…" maxlength="20" style="width:180px"/>
-        <button class="btn-primary" id="loginBtn">JOIN</button>\`;
-      document.getElementById("loginBtn").addEventListener("click", async()=>{
-        const username=document.getElementById("username").value.trim();
+        <span style="font-size:12px;color:var(--muted)">or enter username:</span>
+        <input class="auth-input" id="usernameIn" placeholder="username…" maxlength="20"/>
+        <button class="btn-primary" id="joinBtn" style="padding:9px 18px">Join</button>
+        <span style="font-size:12px;color:var(--muted);margin-left:auto">Sign in to post arguments & vote</span>
+      \`;
+      document.getElementById("joinBtn").addEventListener("click",async()=>{
+        const username=document.getElementById("usernameIn").value.trim();
         if(!username)return;
         const r=await api("/auth/login",{method:"POST",body:JSON.stringify({username})});
         if(r.error)return alert(r.error);
-        await loadMe();
+        await loadNav();
       });
     } else {
-      navRight.innerHTML=\`<strong>\${esc(me.username)}</strong><span style="color:var(--gold)"> ★\${me.rating}</span>\`;
-      authArea.innerHTML=\`
-        <span style="font-size:14px;color:var(--muted2)">Welcome back, <strong style="color:var(--text)">\${esc(me.username)}</strong></span>
-        <a href="/u/\${esc(me.username)}" class="btn-out">My Profile</a>
-        <button class="btn-out" id="logoutBtn">Sign out</button>\`;
+      navRight.innerHTML=\`<a href="/u/\${esc(me.username)}" style="font-weight:600">\${esc(me.username)}</a><span style="color:var(--gold)"> ★\${me.rating}</span>\`;
+      strip.innerHTML=\`
+        <span style="font-size:13px">👋 Logged in as <strong>\${esc(me.username)}</strong> — <span style="color:var(--gold)">★ \${me.rating} pts</span></span>
+        <a href="/u/\${esc(me.username)}" class="btn-out" style="margin-left:auto">My Profile</a>
+        <button class="btn-out" id="logoutBtn">Sign out</button>
+      \`;
       document.getElementById("logoutBtn").addEventListener("click",async()=>{
-        await api("/auth/logout",{method:"POST"});await loadMe();
+        await api("/auth/logout",{method:"POST"});await loadNav();
       });
     }
   }
 
+  function debateCard(d){
+    const total=d.yes_count+d.no_count;
+    const yp=total>0?Math.round(d.yes_count/total*100):50;
+    const t=d.type||"question";
+    return \`<a class="dcard" href="/debate/\${d.id}">
+      <div class="dcard-top">
+        <span class="cat-tag \${t}">\${esc(d.category)}</span>
+        <span class="arg-ct">\${d.arg_count} args</span>
+      </div>
+      <div class="dcard-q">\${esc(d.question)}</div>
+      <div class="dcard-bar"><div class="dcard-yes" style="width:\${yp}%"></div></div>
+      <div class="dcard-nums">
+        <span style="color:var(--yes)">YES \${yp}%</span>
+        <span style="color:var(--no)">\${100-yp}% NO</span>
+      </div>
+      <div class="dcard-open">Debate this →</div>
+    </a>\`;
+  }
+
+  function renderColumns(){
+    const cat=currentCat==="All";
+    const events = allDebates.filter(d=>(d.type||"question")==="event" && (cat||d.category===currentCat));
+    const questions = allDebates.filter(d=>(d.type||"question")==="question" && (cat||d.category===currentCat));
+    document.getElementById("eventsCol").innerHTML = events.length
+      ? events.map(debateCard).join("")
+      : \`<div class="empty-col">No events yet — check back soon or add some in the admin panel.</div>\`;
+    document.getElementById("questionsCol").innerHTML = questions.length
+      ? questions.map(debateCard).join("")
+      : \`<div class="empty-col">No questions yet.</div>\`;
+  }
+
   async function loadDebates(){
-    allDebates = await api("/api/debates").catch(()=>[]);
-
-    // stats
-    const total = allDebates.reduce((s,d)=>s+d.arg_count,0);
-    document.getElementById("statsBar").innerHTML=\`
-      <div class="stat-item"><div class="stat-num">\${allDebates.length}</div><div class="stat-lbl">DEBATES</div></div>
-      <div class="stat-item"><div class="stat-num">\${total}</div><div class="stat-lbl">ARGUMENTS</div></div>
-    \`;
-
+    allDebates=await api("/api/debates").catch(()=>[]);
     const cats=["All",...new Set(allDebates.map(d=>d.category))];
     document.getElementById("filterRow").innerHTML=cats.map(c=>
-      \`<button class="filter-btn \${c===currentCat?'on':''}" data-cat="\${esc(c)}">\${esc(c)}</button>\`
+      \`<button class="filter-btn \${c===currentCat?"on":""}" data-cat="\${esc(c)}">\${esc(c)}</button>\`
     ).join("");
     document.getElementById("filterRow").querySelectorAll(".filter-btn").forEach(btn=>{
       btn.addEventListener("click",()=>{
         currentCat=btn.getAttribute("data-cat");
         document.querySelectorAll(".filter-btn").forEach(b=>b.classList.toggle("on",b.getAttribute("data-cat")===currentCat));
-        renderGrid();
+        renderColumns();
       });
     });
-    renderGrid();
+    renderColumns();
   }
 
-  function renderGrid(){
-    const list = currentCat==="All" ? allDebates : allDebates.filter(d=>d.category===currentCat);
-    const grid = document.getElementById("grid");
-    if(!list.length){grid.innerHTML='<div style="color:var(--muted);grid-column:1/-1;text-align:center;padding:40px">No debates</div>';return;}
-    grid.innerHTML=list.map(d=>{
-      const total=d.yes_count+d.no_count;
-      const yp = total>0 ? Math.round(d.yes_count/total*100) : 50;
-      return \`<a class="debate-card" href="/debate/\${d.id}">
-        <div style="display:flex;align-items:center;justify-content:space-between">
-          <span class="cat-tag">\${esc(d.category)}</span>
-          <span class="arg-count">\${d.arg_count} args</span>
-        </div>
-        <div class="debate-q">\${esc(d.question)}</div>
-        <div class="vote-bar">
-          <div class="bar-yes" style="width:\${yp}%"></div>
-          <div class="bar-no"  style="width:\${100-yp}%"></div>
-        </div>
-        <div class="vote-nums">
-          <span class="vote-yes">YES \${yp}%</span>
-          <span class="vote-no">\${100-yp}% NO</span>
-        </div>
-        <div class="open-btn">Open debate →</div>
-      </a>\`;
-    }).join("");
-  }
-
-  loadMe(); loadDebates();
+  loadNav(); loadDebates();
 </script>
 </body></html>`;
 }
@@ -853,7 +1154,7 @@ function debatePage(debateId, question, category) {
 </nav>
 <div class="page">
   <div class="hero">
-    <a class="back-link" href="/">← All debates</a>
+    <a class="back-link" href="/explore">← All debates</a>
     <div class="eyebrow"><span class="live-dot"></span>${esc(category)}</div>
     <h1 class="hero-q">${esc(question)}</h1>
     <div class="scoreboard">
@@ -1218,20 +1519,26 @@ function adminLoginPage(err) {
 // ADMIN DASHBOARD PAGE
 // ─────────────────────────────────────────────────────────
 function adminPage() {
+  const CATS = ["Technology","Economy","Society","Politics","Education","Life","Work","General"];
+  const catOpts = CATS.map(c => `<option>${c}</option>`).join("");
   return `<!doctype html><html lang="en">
 <head>
   <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>Admin — ARGU</title>
   ${BASE_CSS}
   <style>
-    .page{max-width:1160px;margin:0 auto;padding:32px 24px 80px;position:relative;z-index:1;}
+    .page{max-width:1200px;margin:0 auto;padding:32px 24px 80px;position:relative;z-index:1;}
     h2{font-family:'Unbounded',sans-serif;font-size:20px;font-weight:800;margin-bottom:20px;}
     h3{font-family:'Unbounded',sans-serif;font-size:13px;font-weight:700;margin-bottom:14px;}
-    /* Tabs */
     .tabs{display:flex;gap:4px;margin-bottom:24px;background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:4px;width:fit-content;}
     .tab{padding:8px 18px;border-radius:9px;font-size:12px;font-weight:700;cursor:pointer;color:var(--muted2);border:none;background:transparent;transition:all .15s;font-family:'Unbounded',sans-serif;letter-spacing:.03em;}
     .tab.on{background:var(--bg3);color:var(--text);border:1px solid var(--border2);}
     .tab-panel{display:none;} .tab-panel.on{display:block;}
+    /* Modal */
+    .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:200;display:flex;align-items:center;justify-content:center;padding:20px;}
+    .modal-bg.hidden{display:none;}
+    .modal{background:var(--bg2);border:1px solid var(--border2);border-radius:20px;padding:28px;width:100%;max-width:500px;}
+    .modal-actions{display:flex;gap:8px;margin-top:18px;justify-content:flex-end;}
     /* KPIs */
     .stats-row{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:22px;}
     .kpi{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:16px 20px;min-width:120px;}
@@ -1245,7 +1552,7 @@ function adminPage() {
     /* Forms */
     .field{margin-bottom:10px;}
     .field label{display:block;font-size:11px;color:var(--muted);margin-bottom:5px;}
-    .field input,.field select{width:100%;padding:10px 12px;border-radius:9px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-family:'Manrope',sans-serif;font-size:13px;outline:none;transition:border-color .18s;}
+    .field input,.field select,.field textarea{width:100%;padding:10px 12px;border-radius:9px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-family:'Manrope',sans-serif;font-size:13px;outline:none;transition:border-color .18s;}
     .field input:focus,.field select:focus{border-color:rgba(59,130,246,.5);}
     /* Tables */
     .table{width:100%;border-collapse:collapse;font-size:13px;}
@@ -1257,8 +1564,8 @@ function adminPage() {
     .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:700;}
     .badge.on{background:rgba(34,197,94,.15);color:#22c55e;border:1px solid rgba(34,197,94,.3);}
     .badge.off{background:var(--bg3);color:var(--muted);border:1px solid var(--border);}
-    .badge.yes{background:var(--yes-dim);color:var(--yes);border:1px solid rgba(59,130,246,.3);}
-    .badge.no{background:var(--no-dim);color:var(--no);border:1px solid rgba(239,68,68,.3);}
+    .badge.event{background:rgba(245,158,11,.12);color:#f59e0b;border:1px solid rgba(245,158,11,.3);}
+    .badge.question{background:var(--yes-dim);color:var(--accent);border:1px solid rgba(59,130,246,.3);}
     /* Buttons */
     .btn-sm{padding:5px 11px;border-radius:7px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid var(--border);background:var(--bg3);color:var(--muted2);transition:all .15s;}
     .btn-sm:hover{border-color:var(--border2);color:var(--text);}
@@ -1266,23 +1573,26 @@ function adminPage() {
     .btn-danger:hover{background:var(--no-dim);border-color:var(--no);}
     .btn-success{border-color:rgba(34,197,94,.35);color:#22c55e;}
     .btn-success:hover{background:rgba(34,197,94,.1);border-color:#22c55e;}
-    /* Debate expand */
-    .debate-row{cursor:pointer;}
-    .debate-row td:first-child::before{content:"▶ ";font-size:10px;color:var(--muted);margin-right:4px;}
+    .btn-edit{border-color:rgba(59,130,246,.35);color:var(--accent);}
+    .btn-edit:hover{background:var(--yes-dim);border-color:var(--accent);}
+    /* Expandable rows */
+    .debate-row td:first-child::before{content:"▶ ";font-size:10px;color:var(--muted);}
     .debate-row.open td:first-child::before{content:"▼ ";}
     .args-row{display:none;}
     .args-row.open{display:table-row;}
     .args-inner{padding:0 10px 14px;background:var(--bg3);}
-    .arg-item{display:flex;align-items:flex-start;gap:10px;padding:10px 0;border-bottom:1px solid var(--border);}
-    .arg-item:last-child{border-bottom:none;}
-    .arg-text{flex:1;font-size:13px;color:rgba(234,237,243,.8);line-height:1.5;}
-    .arg-meta{font-size:11px;color:var(--muted);white-space:nowrap;}
-    /* Logout */
+    /* Category cards */
+    .cat-card{background:var(--bg2);border:1px solid var(--border);border-radius:14px;padding:20px;margin-bottom:12px;}
+    .cat-card-header{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap;}
+    .cat-card-name{font-family:'Unbounded',sans-serif;font-size:14px;font-weight:700;flex:1;}
+    .cat-card-count{font-size:12px;color:var(--muted);}
+    .cat-pills{display:flex;flex-wrap:wrap;gap:6px;}
+    .cat-pill{font-size:11px;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:3px 8px;color:var(--muted2);}
+    /* Layout */
+    .two-col{display:grid;grid-template-columns:380px 1fr;gap:20px;align-items:start;}
+    @media(max-width:760px){.two-col{grid-template-columns:1fr;}}
     .logout-btn{padding:8px 16px;border-radius:9px;border:1px solid var(--border);background:transparent;color:var(--muted2);font-size:12px;cursor:pointer;}
     .logout-btn:hover{color:var(--text);}
-    /* Two col */
-    .two-col{display:grid;grid-template-columns:360px 1fr;gap:20px;align-items:start;}
-    @media(max-width:760px){.two-col{grid-template-columns:1fr;}}
   </style>
 </head>
 <body>
@@ -1297,12 +1607,14 @@ function adminPage() {
     </div>
   </div>
 </nav>
+
 <div class="page">
   <h2>🛡️ Admin Dashboard</h2>
 
   <div class="tabs">
     <button class="tab on" data-tab="overview">📊 Overview</button>
     <button class="tab" data-tab="debates">💬 Debates</button>
+    <button class="tab" data-tab="categories">🗂️ Categories</button>
     <button class="tab" data-tab="users">👥 Users</button>
   </div>
 
@@ -1317,27 +1629,37 @@ function adminPage() {
 
   <!-- DEBATES TAB -->
   <div class="tab-panel" id="tab-debates">
-    <div class="two-col">
+    <div class="two-col" style="margin-bottom:20px;">
       <div class="card">
         <h3>➕ Add New Debate</h3>
         <div class="field"><label>Question</label><input id="newQ" placeholder="Should AI have rights?"/></div>
         <div class="field">
           <label>Category</label>
-          <select id="newCat">
-            <option>Technology</option><option>Economy</option><option>Society</option>
-            <option>Politics</option><option>Education</option><option>Life</option>
-            <option>Work</option><option>General</option>
+          <select id="newCat">${catOpts}</select>
+        </div>
+        <div class="field">
+          <label>Type</label>
+          <select id="newType">
+            <option value="question">💭 Question — timeless topic</option>
+            <option value="event">🌍 Event — current world event</option>
           </select>
         </div>
         <button class="btn-primary" style="width:100%;padding:11px;margin-top:4px;" id="addBtn">Add Debate</button>
       </div>
       <div></div>
     </div>
-
-    <div class="card" style="margin-top:16px;">
-      <h3>📋 All Debates — click a row to see & delete arguments</h3>
+    <div class="card">
+      <h3>📋 All Debates — click row to expand arguments</h3>
       <div id="debatesTable"><div style="color:var(--muted);font-size:13px">Loading…</div></div>
     </div>
+  </div>
+
+  <!-- CATEGORIES TAB -->
+  <div class="tab-panel" id="tab-categories">
+    <p style="font-size:13px;color:var(--muted2);margin-bottom:20px;">
+      Move all debates from one category into another, or delete a category entirely (this also deletes all debates in it).
+    </p>
+    <div id="categoriesPanel"><div style="color:var(--muted);font-size:13px">Loading…</div></div>
   </div>
 
   <!-- USERS TAB -->
@@ -1349,9 +1671,36 @@ function adminPage() {
   </div>
 </div>
 
+<!-- EDIT MODAL -->
+<div class="modal-bg hidden" id="editModal">
+  <div class="modal">
+    <h3 style="font-family:'Unbounded',sans-serif;font-size:14px;font-weight:700;margin-bottom:18px;">✏️ Edit Debate</h3>
+    <input type="hidden" id="editId"/>
+    <div class="field"><label>Question</label><input id="editQ"/></div>
+    <div class="field">
+      <label>Category</label>
+      <select id="editCat">${catOpts}</select>
+    </div>
+    <div class="field">
+      <label>Type</label>
+      <select id="editType">
+        <option value="question">💭 Question</option>
+        <option value="event">🌍 Event</option>
+      </select>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-sm" id="editCancel">Cancel</button>
+      <button class="btn-primary" id="editSave">Save changes</button>
+    </div>
+  </div>
+</div>
+
 <script>
   function esc(s){return String(s).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");}
-  async function api(url,opts={}){const r=await fetch(url,{headers:{"content-type":"application/json"},...opts});return r.json();}
+  async function api(url,opts={}){
+    const r=await fetch(url,{headers:{"content-type":"application/json"},...opts});
+    return r.json();
+  }
 
   // ── Tabs
   document.querySelectorAll(".tab").forEach(tab=>{
@@ -1363,190 +1712,260 @@ function adminPage() {
     });
   });
 
-  // ── Load everything
-  async function loadStats(){
+  // ── Edit modal
+  const editModal = document.getElementById("editModal");
+  document.getElementById("editCancel").onclick = () => editModal.classList.add("hidden");
+  editModal.addEventListener("click", e => { if(e.target===editModal) editModal.classList.add("hidden"); });
+
+  function openEdit(id, q, cat, type) {
+    document.getElementById("editId").value  = id;
+    document.getElementById("editQ").value   = q;
+    document.getElementById("editCat").value = cat;
+    document.getElementById("editType").value= type || "question";
+    editModal.classList.remove("hidden");
+    document.getElementById("editQ").focus();
+  }
+
+  document.getElementById("editSave").onclick = async () => {
+    const id  = document.getElementById("editId").value;
+    const q   = document.getElementById("editQ").value.trim();
+    const cat = document.getElementById("editCat").value;
+    const typ = document.getElementById("editType").value;
+    if(!q) return alert("Question cannot be empty");
+    const r = await api("/admin/debates/"+id, {method:"PATCH", body:JSON.stringify({question:q,category:cat,type:typ})});
+    if(r.error) return alert(r.error);
+    editModal.classList.add("hidden");
+    await loadAll();
+  };
+
+  // ── All data state
+  let allDebates = [], allUsers = [], dailyData = [], statsData = {};
+
+  async function loadAll() {
     let d;
     try {
       d = await api("/admin/api/stats");
-      if(!d || d.error) throw new Error(d?.error || "API failed");
+      if(!d || d.error) throw new Error(d?.error || "API error");
     } catch(e) {
-      document.getElementById("kpiRow").innerHTML=\`<div style="color:var(--no);font-size:13px">❌ Failed to load stats: \${e.message}</div>\`;
+      document.getElementById("kpiRow").innerHTML =
+        '<div style="color:var(--no);font-size:13px">Error loading stats: '+e.message+'</div>';
       return;
     }
-
-    // ── KPIs
-    try {
-      document.getElementById("kpiRow").innerHTML=\`
-        <div class="kpi"><div class="kpi-n">\${d.debates}</div><div class="kpi-l">Debates</div></div>
-        <div class="kpi"><div class="kpi-n">\${d.users}</div><div class="kpi-l">Users</div></div>
-        <div class="kpi"><div class="kpi-n">\${d.messages}</div><div class="kpi-l">Arguments</div></div>
-        <div class="kpi"><div class="kpi-n">\${d.total_views||0}</div><div class="kpi-l">Page Views</div></div>
-        <div class="kpi"><div class="kpi-n" style="color:var(--accent)">\${d.unique_visitors||0}</div><div class="kpi-l">Unique Visitors</div></div>
-      \`;
-    } catch(e) { console.error("KPI render error", e); }
-
-    // ── Chart
-    try {
-      const daily = (d.daily||[]).slice().reverse();
-      const maxV = daily.length > 0 ? Math.max(...daily.map(r=>Number(r.uniq)||0), 1) : 1;
-      const chartEl = document.getElementById("chart");
-      if (!daily.length) {
-        chartEl.innerHTML='<div style="color:var(--muted);font-size:13px;padding:8px 0">No visit data yet — open your site a few times first</div>';
-      } else {
-        chartEl.innerHTML = daily.map(r=>{
-          const h = Math.max(4, Math.round((Number(r.uniq)||0) / maxV * 100));
-          const date = r.day ? new Date(r.day).toLocaleDateString("en-US",{month:"short",day:"numeric"}) : "?";
-          return \`<div class="chart-col">
-            <div class="chart-fill" style="height:\${h}px" title="\${r.uniq||0} unique · \${r.views||0} total"></div>
-            <div class="chart-lbl">\${date}</div>
-          </div>\`;
-        }).join("");
-      }
-    } catch(e) {
-      document.getElementById("chart").innerHTML=\`<div style="color:var(--muted);font-size:13px">Chart error: \${e.message}</div>\`;
-      console.error("Chart render error", e);
-    }
-
-    // ── Debates table
-    try {
-      const debates = d.top_debates || [];
-      if (!debates.length) {
-        document.getElementById("debatesTable").innerHTML='<div style="color:var(--muted);font-size:13px">No debates yet</div>';
-      } else {
-        const tbody = debates.map(dbt=>\`
-          <tr class="debate-row" data-id="\${dbt.id}">
-            <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${esc(dbt.question)}</td>
-            <td>\${esc(dbt.category||'')}</td>
-            <td>\${dbt.arg_count||0}</td>
-            <td>\${dbt.views||0}</td>
-            <td><span class="badge \${dbt.active?"on":"off"}">\${dbt.active?"Active":"Hidden"}</span></td>
-            <td>
-              <div style="display:flex;gap:5px;flex-wrap:wrap">
-                <button class="btn-sm btn-success" onclick="event.stopPropagation();toggleDebate(\${dbt.id})">\${dbt.active?"Hide":"Show"}</button>
-                <button class="btn-sm btn-danger"  onclick="event.stopPropagation();delDebate(\${dbt.id})">Delete all</button>
-              </div>
-            </td>
-          </tr>
-          <tr class="args-row" id="args-\${dbt.id}">
-            <td colspan="6" style="padding:0">
-              <div class="args-inner" id="args-inner-\${dbt.id}">
-                <div style="color:var(--muted);font-size:13px;padding:12px 0">Click the row above to load arguments</div>
-              </div>
-            </td>
-          </tr>
-        \`).join("");
-
-        document.getElementById("debatesTable").innerHTML=\`
-          <table class="table">
-            <thead><tr>
-              <th>Question</th><th>Category</th><th>Args</th><th>Views</th><th>Status</th><th>Actions</th>
-            </tr></thead>
-            <tbody>\${tbody}</tbody>
-          </table>
-        \`;
-
-        document.querySelectorAll(".debate-row").forEach(row=>{
-          row.addEventListener("click",()=>{
-            const id=row.dataset.id;
-            const isOpen=row.classList.contains("open");
-            document.querySelectorAll(".debate-row").forEach(r=>r.classList.remove("open"));
-            document.querySelectorAll(".args-row").forEach(r=>r.classList.remove("open"));
-            if(!isOpen){
-              row.classList.add("open");
-              document.getElementById("args-"+id).classList.add("open");
-              loadArgs(id);
-            }
-          });
-        });
-      }
-    } catch(e) {
-      document.getElementById("debatesTable").innerHTML=\`<div style="color:var(--no);font-size:13px">Error: \${e.message}</div>\`;
-      console.error("Debates render error", e);
-    }
-
-    // ── Users table
-    try {
-      const users = d.recent_users || [];
-      if (!users.length) {
-        document.getElementById("usersTable").innerHTML='<div style="color:var(--muted);font-size:13px">No users yet</div>';
-      } else {
-        document.getElementById("usersTable").innerHTML=\`
-          <table class="table">
-            <thead><tr><th>Username</th><th>Rating</th><th>Arguments</th><th>Joined</th></tr></thead>
-            <tbody>
-            \${users.map(u=>\`
-              <tr>
-                <td><a href="/u/\${esc(u.username)}" style="font-weight:600">\${esc(u.username)}</a></td>
-                <td style="color:var(--gold);font-weight:700">\${u.rating}</td>
-                <td>\${u.arg_count||0}</td>
-                <td style="color:var(--muted)">\${u.created_at ? new Date(u.created_at).toLocaleDateString() : "—"}</td>
-              </tr>
-            \`).join("")}
-            </tbody>
-          </table>
-        \`;
-      }
-    } catch(e) {
-      document.getElementById("usersTable").innerHTML=\`<div style="color:var(--no);font-size:13px">Error: \${e.message}</div>\`;
-      console.error("Users render error", e);
-    }
+    allDebates = d.top_debates || [];
+    allUsers   = d.recent_users || [];
+    dailyData  = d.daily || [];
+    statsData  = d;
+    renderKpis();
+    renderChart();
+    renderDebatesTable();
+    renderCategories();
+    renderUsers();
   }
 
-  // ── Load arguments for a debate
-  async function loadArgs(debateId){
-    const inner=document.getElementById("args-inner-"+debateId);
-    const rows=await api("/debate/"+debateId+"/messages?limit=200&sort=new").catch(()=>[]);
-    if(!rows.length){
-      inner.innerHTML='<div style="color:var(--muted);font-size:13px;padding:12px 0">No arguments yet</div>';
+  function renderKpis() {
+    document.getElementById("kpiRow").innerHTML = [
+      [statsData.debates,         "Debates"],
+      [statsData.users,           "Users"],
+      [statsData.messages,        "Arguments"],
+      [statsData.total_views||0,  "Page Views"],
+      [statsData.unique_visitors||0, "Unique Visitors"],
+    ].map(([n,l]) =>
+      '<div class="kpi">' +
+      '<div class="kpi-n" '+(l==="Unique Visitors"?'style="color:var(--accent)"':'')+'>'+n+'</div>'+
+      '<div class="kpi-l">'+l+'</div></div>'
+    ).join("");
+  }
+
+  function renderChart() {
+    const daily = dailyData.slice().reverse();
+    const maxV  = daily.length ? Math.max(...daily.map(r=>Number(r.uniq)||0), 1) : 1;
+    if(!daily.length) {
+      document.getElementById("chart").innerHTML =
+        '<div style="color:var(--muted);font-size:13px">No data yet — open your site first</div>';
       return;
     }
-    inner.innerHTML=rows.map(m=>\`
-      <div class="arg-item">
-        <span class="badge \${m.side.toLowerCase()}">\${m.side}</span>
-        <div class="arg-text">
-          <span style="font-weight:600;font-size:12px">\${esc(m.username)}</span>
-          <span style="color:var(--muted);font-size:11px;margin:0 6px">score: \${m.score}</span>
-          <br/>\${esc(m.text)}
-        </div>
-        <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">
-          <span class="arg-meta">\${new Date(m.created_at).toLocaleDateString()}</span>
-          <button class="btn-sm btn-danger" onclick="delMsg(\${m.id},\${debateId})">Delete</button>
-        </div>
-      </div>
-    \`).join("");
+    document.getElementById("chart").innerHTML = daily.map(r => {
+      const h    = Math.max(4, Math.round((Number(r.uniq)||0)/maxV*100));
+      const date = r.day ? new Date(r.day).toLocaleDateString("en-US",{month:"short",day:"numeric"}) : "?";
+      return '<div class="chart-col">' +
+        '<div class="chart-fill" style="height:'+h+'px" title="'+(r.uniq||0)+' unique"></div>' +
+        '<div class="chart-lbl">'+date+'</div></div>';
+    }).join("");
+  }
+
+  function renderDebatesTable() {
+    if(!allDebates.length) {
+      document.getElementById("debatesTable").innerHTML =
+        '<div style="color:var(--muted);font-size:13px">No debates yet</div>';
+      return;
+    }
+    const rows = allDebates.map(dbt => {
+      const typeLabel = dbt.type === "event" ? "🌍" : "💭";
+      return '<tr class="debate-row" style="cursor:pointer" data-id="'+dbt.id+'">' +
+        '<td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(dbt.question||"")+'</td>' +
+        '<td>'+esc(dbt.category||"")+'</td>' +
+        '<td><span class="badge '+(dbt.type||"question")+'">'+typeLabel+' '+(dbt.type||"question")+'</span></td>' +
+        '<td>'+(dbt.arg_count||0)+'</td>' +
+        '<td>'+(dbt.views||0)+'</td>' +
+        '<td><span class="badge '+(dbt.active?"on":"off")+'">'+(dbt.active?"Active":"Hidden")+'</span></td>' +
+        '<td><div style="display:flex;gap:4px;flex-wrap:wrap">' +
+          '<button class="btn-sm btn-edit" onclick="event.stopPropagation();openEdit('+dbt.id+',allDebates.find(d=>d.id==='+dbt.id+').question,allDebates.find(d=>d.id==='+dbt.id+').category,allDebates.find(d=>d.id==='+dbt.id+').type)">✏️ Edit</button>' +
+          '<button class="btn-sm btn-success" onclick="event.stopPropagation();toggleDebate('+dbt.id+')">'+(dbt.active?"Hide":"Show")+'</button>' +
+          '<button class="btn-sm btn-danger" onclick="event.stopPropagation();delDebate('+dbt.id+')">🗑️</button>' +
+        '</div></td>' +
+      '</tr>' +
+      '<tr class="args-row" id="args-'+dbt.id+'"><td colspan="7" style="padding:0">' +
+        '<div class="args-inner" id="args-inner-'+dbt.id+'">' +
+          '<div style="color:var(--muted);font-size:13px;padding:10px 0">Click the row above to load arguments</div>' +
+        '</div></td></tr>';
+    }).join("");
+
+    document.getElementById("debatesTable").innerHTML =
+      '<table class="table"><thead><tr>' +
+      '<th>Question</th><th>Category</th><th>Type</th><th>Args</th><th>Views</th><th>Status</th><th>Actions</th>' +
+      '</tr></thead><tbody>'+rows+'</tbody></table>';
+
+    document.querySelectorAll(".debate-row").forEach(row => {
+      row.addEventListener("click", () => {
+        const id     = row.dataset.id;
+        const isOpen = row.classList.contains("open");
+        document.querySelectorAll(".debate-row").forEach(r => r.classList.remove("open"));
+        document.querySelectorAll(".args-row").forEach(r => r.classList.remove("open"));
+        if(!isOpen) {
+          row.classList.add("open");
+          document.getElementById("args-"+id).classList.add("open");
+          loadArgs(id);
+        }
+      });
+    });
+  }
+
+  function renderCategories() {
+    // Group debates by category
+    const catMap = {};
+    allDebates.forEach(dbt => {
+      const c = dbt.category || "General";
+      if(!catMap[c]) catMap[c] = [];
+      catMap[c].push(dbt);
+    });
+    const cats = Object.keys(catMap).sort();
+    if(!cats.length) {
+      document.getElementById("categoriesPanel").innerHTML =
+        '<div style="color:var(--muted);font-size:13px">No categories yet</div>';
+      return;
+    }
+    const ALL_CATS = ["Technology","Economy","Society","Politics","Education","Life","Work","General"];
+    document.getElementById("categoriesPanel").innerHTML = cats.map(cat => {
+      const items   = catMap[cat];
+      const targets = ALL_CATS.filter(c => c !== cat);
+      const selId   = "moveSel-"+cat.replace(/[^a-z0-9]/gi,"_");
+      const opts    = targets.map(c => '<option value="'+c+'">'+c+'</option>').join("");
+      const pills   = items.map(d =>
+        '<span class="cat-pill">'+esc(d.question.length>45 ? d.question.slice(0,45)+"…" : d.question)+'</span>'
+      ).join("");
+      return '<div class="cat-card">' +
+        '<div class="cat-card-header">' +
+          '<span class="cat-card-name">📁 '+esc(cat)+'</span>' +
+          '<span class="cat-card-count">'+items.length+' debate'+(items.length!==1?"s":"")+'</span>' +
+          '<select id="'+selId+'" style="padding:6px 10px;border-radius:8px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-size:12px;outline:none">'+opts+'</select>' +
+          '<button class="btn-sm btn-edit" onclick="moveCategory(\''+cat+'\',document.getElementById(\''+selId+'\').value)">Move all →</button>' +
+          '<button class="btn-sm btn-danger" onclick="deleteCategory(\''+cat+'\')">Delete category</button>' +
+        '</div>' +
+        '<div class="cat-pills">'+pills+'</div>' +
+      '</div>';
+    }).join("");
+  }
+
+  function renderUsers() {
+    if(!allUsers.length) {
+      document.getElementById("usersTable").innerHTML =
+        '<div style="color:var(--muted);font-size:13px">No users yet</div>';
+      return;
+    }
+    const rows = allUsers.map(u =>
+      '<tr>' +
+      '<td><a href="/u/'+esc(u.username)+'" style="font-weight:600">'+esc(u.username)+'</a></td>' +
+      '<td style="color:var(--gold);font-weight:700">'+u.rating+'</td>' +
+      '<td>'+(u.arg_count||0)+'</td>' +
+      '<td style="color:var(--muted)">'+(u.created_at ? new Date(u.created_at).toLocaleDateString() : "—")+'</td>' +
+      '</tr>'
+    ).join("");
+    document.getElementById("usersTable").innerHTML =
+      '<table class="table"><thead><tr><th>Username</th><th>Rating</th><th>Arguments</th><th>Joined</th></tr></thead>' +
+      '<tbody>'+rows+'</tbody></table>';
+  }
+
+  // ── Load arguments inline
+  async function loadArgs(debateId) {
+    const inner = document.getElementById("args-inner-"+debateId);
+    if(!inner) return;
+    inner.innerHTML = '<div style="color:var(--muted);font-size:13px;padding:10px 0">Loading…</div>';
+    let rows;
+    try { rows = await api("/debate/"+debateId+"/messages?limit=200&sort=new"); }
+    catch(e) { inner.innerHTML = '<div style="color:var(--no);font-size:13px">Error loading</div>'; return; }
+    if(!rows || !rows.length) {
+      inner.innerHTML = '<div style="color:var(--muted);font-size:13px;padding:10px 0">No arguments yet</div>';
+      return;
+    }
+    inner.innerHTML = rows.map(m =>
+      '<div style="display:flex;align-items:flex-start;gap:10px;padding:10px 0;border-bottom:1px solid var(--border);">' +
+        '<span class="badge '+(m.side||"").toLowerCase()+'">'+(m.side||"")+'</span>' +
+        '<div style="flex:1;font-size:13px;color:rgba(234,237,243,.8);line-height:1.5">' +
+          '<span style="font-weight:600;font-size:12px">'+esc(m.username||"")+'</span>' +
+          '<span style="color:var(--muted);font-size:11px;margin:0 6px">score: '+m.score+'</span>' +
+          '<br/>'+esc(m.text||"")+'</div>' +
+        '<div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">' +
+          '<span style="font-size:11px;color:var(--muted)">'+new Date(m.created_at).toLocaleDateString()+'</span>' +
+          '<button class="btn-sm btn-danger" onclick="delMsg('+m.id+','+debateId+')">Delete</button>' +
+        '</div>' +
+      '</div>'
+    ).join("");
   }
 
   // ── Actions
-  async function toggleDebate(id){
-    await api("/admin/debates/"+id+"/toggle",{method:"POST"});
-    await loadStats();
+  async function toggleDebate(id) {
+    await api("/admin/debates/"+id+"/toggle", {method:"POST"});
+    await loadAll();
   }
-
-  async function delDebate(id){
-    if(!confirm("Delete this debate AND all its arguments? This cannot be undone."))return;
-    await api("/admin/debates/"+id,{method:"DELETE"});
-    await loadStats();
+  async function delDebate(id) {
+    if(!confirm("Delete this debate AND all its arguments? Cannot be undone.")) return;
+    await api("/admin/debates/"+id, {method:"DELETE"});
+    await loadAll();
   }
-
-  async function delMsg(msgId, debateId){
-    if(!confirm("Delete this argument?"))return;
-    await api("/admin/messages/"+msgId,{method:"DELETE"});
+  async function delMsg(msgId, debateId) {
+    if(!confirm("Delete this argument?")) return;
+    await api("/admin/messages/"+msgId, {method:"DELETE"});
     await loadArgs(debateId);
+  }
+  async function moveCategory(from, to) {
+    if(!to) return alert("Select a target category first");
+    if(!confirm('Move ALL debates from "'+from+'" → "'+to+'"?')) return;
+    const r = await api("/admin/category/"+encodeURIComponent(from),
+      {method:"DELETE", body:JSON.stringify({action:"move", target:to})});
+    if(r.error) return alert(r.error);
+    await loadAll();
+  }
+  async function deleteCategory(name) {
+    if(!confirm('Delete category "'+name+'" and ALL its debates? Cannot be undone.')) return;
+    const r = await api("/admin/category/"+encodeURIComponent(name),
+      {method:"DELETE", body:JSON.stringify({action:"delete"})});
+    if(r.error) return alert(r.error);
+    await loadAll();
   }
 
   // ── Add debate
-  document.getElementById("addBtn").addEventListener("click",async()=>{
-    const question=document.getElementById("newQ").value.trim();
-    const category=document.getElementById("newCat").value;
-    if(!question)return alert("Enter a question");
-    const r=await api("/admin/debates",{method:"POST",body:JSON.stringify({question,category})});
-    if(r.error)return alert(r.error);
-    document.getElementById("newQ").value="";
-    await loadStats();
-    alert("✅ Debate added!");
+  document.getElementById("addBtn").addEventListener("click", async () => {
+    const question = document.getElementById("newQ").value.trim();
+    const category = document.getElementById("newCat").value;
+    const type     = document.getElementById("newType").value;
+    if(!question) return alert("Enter a question");
+    const r = await api("/admin/debates", {method:"POST", body:JSON.stringify({question,category,type})});
+    if(r.error) return alert(r.error);
+    document.getElementById("newQ").value = "";
+    await loadAll();
   });
 
-  loadStats();
+  loadAll();
 </script>
 </body></html>`;
 }
