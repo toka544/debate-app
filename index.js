@@ -569,6 +569,73 @@ app.get("/live", wrap(async (req, res) => {
   res.type("html").send(livePage());
 }));
 
+// ── Server-side live debate clock
+// Phases: READ=15s, ARGUE=60s, VOTE=45s → total 120s per debate
+const LIVE_PHASES = [
+  { name: "read",  duration: 15  },
+  { name: "argue", duration: 60  },
+  { name: "vote",  duration: 45  },
+];
+const ROUND_TOTAL = LIVE_PHASES.reduce((s,p)=>s+p.duration,0); // 120s
+
+let liveDebateIds  = [];  // shuffled list, refilled as needed
+let liveRoundStart = Date.now(); // when this round started
+
+async function refreshLiveDebates() {
+  try {
+    const r = await pool.query("SELECT id FROM debates WHERE active=TRUE ORDER BY id");
+    const ids = r.rows.map(x=>x.id);
+    // Fisher-Yates shuffle
+    for(let i=ids.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[ids[i],ids[j]]=[ids[j],ids[i]];}
+    liveDebateIds = ids;
+  } catch(e){ console.error("live refresh err:", e.message); }
+}
+refreshLiveDebates();
+
+app.get("/api/live-state", wrap(async (req, res) => {
+  if(!liveDebateIds.length) await refreshLiveDebates();
+  if(!liveDebateIds.length) return res.json({ error: "no debates" });
+
+  const elapsed    = (Date.now() - liveRoundStart) / 1000;
+  const roundIndex = Math.floor(elapsed / ROUND_TOTAL);
+  const withinRound= elapsed % ROUND_TOTAL;
+
+  // which debate
+  const debateIdx  = roundIndex % liveDebateIds.length;
+  const debateId   = liveDebateIds[debateIdx];
+  const nextIdx    = (debateIdx + 1) % liveDebateIds.length;
+  const nextId     = liveDebateIds[nextIdx];
+
+  // which phase
+  let phaseIdx = 0, phaseElapsed = withinRound;
+  for(let i=0;i<LIVE_PHASES.length;i++){
+    if(phaseElapsed < LIVE_PHASES[i].duration){ phaseIdx=i; break; }
+    phaseElapsed -= LIVE_PHASES[i].duration;
+    phaseIdx = i+1;
+  }
+  if(phaseIdx >= LIVE_PHASES.length) phaseIdx = LIVE_PHASES.length-1;
+  const phase    = LIVE_PHASES[phaseIdx];
+  const phaseRemaining = Math.max(0, Math.ceil(phase.duration - phaseElapsed));
+
+  // fetch debate details
+  const [curR, nextR] = await Promise.all([
+    pool.query(`SELECT d.id,d.question,d.category,
+      COUNT(CASE WHEN m.side='YES' THEN 1 END)::int AS yes_count,
+      COUNT(CASE WHEN m.side='NO'  THEN 1 END)::int AS no_count
+      FROM debates d LEFT JOIN messages m ON m.debate_id=d.id
+      WHERE d.id=$1 GROUP BY d.id`, [debateId]),
+    pool.query("SELECT id,question FROM debates WHERE id=$1",[nextId]),
+  ]);
+
+  res.json({
+    debate:    curR.rows[0]  || null,
+    next:      nextR.rows[0] || null,
+    phase:     phase.name,
+    remaining: phaseRemaining,
+    duration:  phase.duration,
+  });
+}));
+
 app.get("/debate", (req, res) => res.redirect("/explore"));
 
 app.get("/debate/:id", wrap(async (req, res) => {
@@ -1643,7 +1710,7 @@ function adminLoginPage(err) {
 // ─────────────────────────────────────────────────────────
 function adminPage() {
   const CATS = ["Technology","Economy","Society","Politics","Education","Life","Work","General"];
-  const catOpts = CATS.map(c => `<option>${c}</option>`).join("");
+  const catOpts = CATS.map(c=>`<option value="${c}">${c}</option>`).join("");
   return `<!doctype html><html lang="en">
 <head>
   <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -1655,41 +1722,32 @@ function adminPage() {
     h3{font-family:'Unbounded',sans-serif;font-size:13px;font-weight:700;margin-bottom:14px;}
     .tabs{display:flex;gap:4px;margin-bottom:24px;background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:4px;width:fit-content;}
     .tab{padding:8px 18px;border-radius:9px;font-size:12px;font-weight:700;cursor:pointer;color:var(--muted2);border:none;background:transparent;transition:all .15s;font-family:'Unbounded',sans-serif;letter-spacing:.03em;}
-    .tab.on{background:var(--bg3);color:var(--text);border:1px solid var(--border2);}
-    .tab-panel{display:none;} .tab-panel.on{display:block;}
-    /* Modal */
+    .tab.active{background:var(--bg3);color:var(--text);border:1px solid var(--border2);}
+    .panel{display:none;} .panel.active{display:block;}
     .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:200;display:flex;align-items:center;justify-content:center;padding:20px;}
     .modal-bg.hidden{display:none;}
     .modal{background:var(--bg2);border:1px solid var(--border2);border-radius:20px;padding:28px;width:100%;max-width:500px;}
     .modal-actions{display:flex;gap:8px;margin-top:18px;justify-content:flex-end;}
-    /* KPIs */
     .stats-row{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:22px;}
     .kpi{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:16px 20px;min-width:120px;}
     .kpi-n{font-family:'Unbounded',sans-serif;font-size:24px;font-weight:900;}
     .kpi-l{font-size:10px;color:var(--muted);margin-top:3px;letter-spacing:.06em;text-transform:uppercase;}
-    /* Chart */
     .chart-bar{height:110px;display:flex;align-items:flex-end;gap:3px;margin-top:8px;}
     .chart-col{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;}
-    .chart-fill{width:100%;background:var(--accent);border-radius:3px 3px 0 0;min-height:2px;transition:height .3s;}
+    .chart-fill{width:100%;background:var(--accent);border-radius:3px 3px 0 0;min-height:2px;}
     .chart-lbl{font-size:9px;color:var(--muted);writing-mode:vertical-rl;transform:rotate(180deg);}
-    /* Forms */
     .field{margin-bottom:10px;}
     .field label{display:block;font-size:11px;color:var(--muted);margin-bottom:5px;}
-    .field input,.field select,.field textarea{width:100%;padding:10px 12px;border-radius:9px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-family:'Manrope',sans-serif;font-size:13px;outline:none;transition:border-color .18s;}
-    .field input:focus,.field select:focus{border-color:rgba(59,130,246,.5);}
-    /* Tables */
-    .table{width:100%;border-collapse:collapse;font-size:13px;}
-    .table th{text-align:left;font-size:10px;font-weight:700;letter-spacing:.08em;color:var(--muted);text-transform:uppercase;padding:8px 10px;border-bottom:1px solid var(--border);}
-    .table td{padding:9px 10px;border-bottom:1px solid var(--border);vertical-align:middle;}
-    .table tr:last-child td{border-bottom:none;}
-    .table tr:hover td{background:rgba(255,255,255,.015);}
-    /* Badges */
+    .field input,.field select{width:100%;padding:10px 12px;border-radius:9px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-family:'Manrope',sans-serif;font-size:13px;outline:none;}
+    .tbl{width:100%;border-collapse:collapse;font-size:13px;}
+    .tbl th{text-align:left;font-size:10px;font-weight:700;letter-spacing:.08em;color:var(--muted);text-transform:uppercase;padding:8px 10px;border-bottom:1px solid var(--border);}
+    .tbl td{padding:9px 10px;border-bottom:1px solid var(--border);vertical-align:middle;}
+    .tbl tr:last-child td{border-bottom:none;}
     .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:700;}
-    .badge.on{background:rgba(34,197,94,.15);color:#22c55e;border:1px solid rgba(34,197,94,.3);}
-    .badge.off{background:var(--bg3);color:var(--muted);border:1px solid var(--border);}
-    .badge.event{background:rgba(245,158,11,.12);color:#f59e0b;border:1px solid rgba(245,158,11,.3);}
-    .badge.question{background:var(--yes-dim);color:var(--accent);border:1px solid rgba(59,130,246,.3);}
-    /* Buttons */
+    .badge-on{background:rgba(34,197,94,.15);color:#22c55e;border:1px solid rgba(34,197,94,.3);}
+    .badge-off{background:var(--bg3);color:var(--muted);border:1px solid var(--border);}
+    .badge-event{background:rgba(245,158,11,.12);color:#f59e0b;border:1px solid rgba(245,158,11,.3);}
+    .badge-q{background:var(--yes-dim);color:var(--accent);border:1px solid rgba(59,130,246,.3);}
     .btn-sm{padding:5px 11px;border-radius:7px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid var(--border);background:var(--bg3);color:var(--muted2);transition:all .15s;}
     .btn-sm:hover{border-color:var(--border2);color:var(--text);}
     .btn-danger{border-color:rgba(239,68,68,.35);color:var(--no);}
@@ -1698,24 +1756,17 @@ function adminPage() {
     .btn-success:hover{background:rgba(34,197,94,.1);border-color:#22c55e;}
     .btn-edit{border-color:rgba(59,130,246,.35);color:var(--accent);}
     .btn-edit:hover{background:var(--yes-dim);border-color:var(--accent);}
-    /* Expandable rows */
-    .debate-row td:first-child::before{content:"▶ ";font-size:10px;color:var(--muted);}
-    .debate-row.open td:first-child::before{content:"▼ ";}
-    .args-row{display:none;}
-    .args-row.open{display:table-row;}
-    .args-inner{padding:0 10px 14px;background:var(--bg3);}
-    /* Category cards */
+    .debate-expand-btn{cursor:pointer;background:none;border:none;color:var(--muted);font-size:11px;padding:2px 6px;}
+    .args-hidden{display:none;}
     .cat-card{background:var(--bg2);border:1px solid var(--border);border-radius:14px;padding:20px;margin-bottom:12px;}
-    .cat-card-header{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap;}
-    .cat-card-name{font-family:'Unbounded',sans-serif;font-size:14px;font-weight:700;flex:1;}
-    .cat-card-count{font-size:12px;color:var(--muted);}
-    .cat-pills{display:flex;flex-wrap:wrap;gap:6px;}
+    .cat-header{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap;}
+    .cat-name{font-family:'Unbounded',sans-serif;font-size:14px;font-weight:700;flex:1;}
+    .cat-pills{display:flex;flex-wrap:wrap;gap:5px;}
     .cat-pill{font-size:11px;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:3px 8px;color:var(--muted2);}
-    /* Layout */
     .two-col{display:grid;grid-template-columns:380px 1fr;gap:20px;align-items:start;}
     @media(max-width:760px){.two-col{grid-template-columns:1fr;}}
     .logout-btn{padding:8px 16px;border-radius:9px;border:1px solid var(--border);background:transparent;color:var(--muted2);font-size:12px;cursor:pointer;}
-    .logout-btn:hover{color:var(--text);}
+    .err-box{background:var(--no-dim);border:1px solid rgba(239,68,68,.3);border-radius:8px;padding:10px 14px;font-size:13px;color:var(--no);margin-bottom:14px;}
   </style>
 </head>
 <body>
@@ -1730,66 +1781,55 @@ function adminPage() {
     </div>
   </div>
 </nav>
-
 <div class="page">
   <h2>🛡️ Admin Dashboard</h2>
-
   <div class="tabs">
-    <button class="tab on" data-tab="overview">📊 Overview</button>
-    <button class="tab" data-tab="debates">💬 Debates</button>
-    <button class="tab" data-tab="categories">🗂️ Categories</button>
-    <button class="tab" data-tab="users">👥 Users</button>
+    <button class="tab active" data-panel="overview">📊 Overview</button>
+    <button class="tab" data-panel="debates">💬 Debates</button>
+    <button class="tab" data-panel="categories">🗂️ Categories</button>
+    <button class="tab" data-panel="users">👥 Users</button>
   </div>
 
-  <!-- OVERVIEW TAB -->
-  <div class="tab-panel on" id="tab-overview">
-    <div class="stats-row" id="kpiRow"><div style="color:var(--muted)">Loading…</div></div>
+  <div class="panel active" id="panel-overview">
+    <div id="kpiRow" class="stats-row"><div style="color:var(--muted)">Loading…</div></div>
     <div class="card">
-      <h3>📈 Daily Unique Visitors (last 14 days)</h3>
-      <div class="chart-bar" id="chart"><div style="color:var(--muted);font-size:13px">Loading…</div></div>
+      <h3>📈 Unique Visitors (14 days)</h3>
+      <div class="chart-bar" id="chartBar"><div style="color:var(--muted);font-size:13px">Loading…</div></div>
     </div>
   </div>
 
-  <!-- DEBATES TAB -->
-  <div class="tab-panel" id="tab-debates">
-    <div class="two-col" style="margin-bottom:20px;">
+  <div class="panel" id="panel-debates">
+    <div class="two-col" style="margin-bottom:20px">
       <div class="card">
         <h3>➕ Add New Debate</h3>
         <div class="field"><label>Question</label><input id="newQ" placeholder="Should AI have rights?"/></div>
-        <div class="field">
-          <label>Category</label>
-          <select id="newCat">${catOpts}</select>
-        </div>
+        <div class="field"><label>Category</label><select id="newCat">${catOpts}</select></div>
         <div class="field">
           <label>Type</label>
           <select id="newType">
-            <option value="question">💭 Question — timeless topic</option>
-            <option value="event">🌍 Event — current world event</option>
+            <option value="question">💭 Question</option>
+            <option value="event">🌍 Event</option>
           </select>
         </div>
-        <button class="btn-primary" style="width:100%;padding:11px;margin-top:4px;" id="addBtn">Add Debate</button>
+        <button class="btn-primary" id="addBtn" style="width:100%;padding:11px;margin-top:4px">Add Debate</button>
       </div>
       <div></div>
     </div>
     <div class="card">
-      <h3>📋 All Debates — click row to expand arguments</h3>
-      <div id="debatesTable"><div style="color:var(--muted);font-size:13px">Loading…</div></div>
+      <h3>📋 All Debates</h3>
+      <div id="debatesTable"><div style="color:var(--muted)">Loading…</div></div>
     </div>
   </div>
 
-  <!-- CATEGORIES TAB -->
-  <div class="tab-panel" id="tab-categories">
-    <p style="font-size:13px;color:var(--muted2);margin-bottom:20px;">
-      Move all debates from one category into another, or delete a category entirely (this also deletes all debates in it).
-    </p>
-    <div id="categoriesPanel"><div style="color:var(--muted);font-size:13px">Loading…</div></div>
+  <div class="panel" id="panel-categories">
+    <p style="font-size:13px;color:var(--muted2);margin-bottom:20px">Move all debates from one category to another, or delete a category entirely (removes all debates in it).</p>
+    <div id="catPanel"><div style="color:var(--muted)">Loading…</div></div>
   </div>
 
-  <!-- USERS TAB -->
-  <div class="tab-panel" id="tab-users">
+  <div class="panel" id="panel-users">
     <div class="card">
-      <h3>👥 All Users (newest first)</h3>
-      <div id="usersTable"><div style="color:var(--muted);font-size:13px">Loading…</div></div>
+      <h3>👥 Users</h3>
+      <div id="usersTable"><div style="color:var(--muted)">Loading…</div></div>
     </div>
   </div>
 </div>
@@ -1797,13 +1837,10 @@ function adminPage() {
 <!-- EDIT MODAL -->
 <div class="modal-bg hidden" id="editModal">
   <div class="modal">
-    <h3 style="font-family:'Unbounded',sans-serif;font-size:14px;font-weight:700;margin-bottom:18px;">✏️ Edit Debate</h3>
-    <input type="hidden" id="editId"/>
+    <h3 style="font-family:'Unbounded',sans-serif;font-size:14px;font-weight:700;margin-bottom:18px">✏️ Edit Debate</h3>
+    <div id="editErr"></div>
     <div class="field"><label>Question</label><input id="editQ"/></div>
-    <div class="field">
-      <label>Category</label>
-      <select id="editCat">${catOpts}</select>
-    </div>
+    <div class="field"><label>Category</label><select id="editCat">${catOpts}</select></div>
     <div class="field">
       <label>Type</label>
       <select id="editType">
@@ -1813,305 +1850,261 @@ function adminPage() {
     </div>
     <div class="modal-actions">
       <button class="btn-sm" id="editCancel">Cancel</button>
-      <button class="btn-primary" id="editSave">Save changes</button>
+      <button class="btn-primary" id="editSave">Save</button>
     </div>
   </div>
 </div>
 
 <script>
-  function esc(s){return String(s).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");}
-  async function api(url,opts={}){
-    const r=await fetch(url,{headers:{"content-type":"application/json"},...opts});
-    return r.json();
+  // ── Helpers
+  function $(id){ return document.getElementById(id); }
+  function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+  async function req(url, opts){
+    const r = await fetch(url, {credentials:"same-origin", headers:{"content-type":"application/json"}, ...opts});
+    const text = await r.text();
+    try { return JSON.parse(text); } catch(e) { return {error: "Bad response: "+text.slice(0,80)}; }
   }
 
-  // ── Tabs
-  document.querySelectorAll(".tab").forEach(tab=>{
-    tab.addEventListener("click",()=>{
-      document.querySelectorAll(".tab").forEach(t=>t.classList.remove("on"));
-      document.querySelectorAll(".tab-panel").forEach(p=>p.classList.remove("on"));
-      tab.classList.add("on");
-      document.getElementById("tab-"+tab.dataset.tab).classList.add("on");
+  // ── Tabs (pure JS, no CSS class dependency for switching)
+  document.querySelectorAll(".tab").forEach(function(tab){
+    tab.addEventListener("click", function(){
+      document.querySelectorAll(".tab").forEach(function(t){ t.classList.remove("active"); });
+      document.querySelectorAll(".panel").forEach(function(p){ p.classList.remove("active"); });
+      tab.classList.add("active");
+      var panel = document.getElementById("panel-"+tab.getAttribute("data-panel"));
+      if(panel) panel.classList.add("active");
     });
   });
 
   // ── Edit modal
-  const editModal = document.getElementById("editModal");
-  document.getElementById("editCancel").onclick = () => editModal.classList.add("hidden");
-  editModal.addEventListener("click", e => { if(e.target===editModal) editModal.classList.add("hidden"); });
+  var editModal = $("editModal");
+  var currentEditId = null;
+  $("editCancel").addEventListener("click", function(){ editModal.classList.add("hidden"); });
+  editModal.addEventListener("click", function(e){ if(e.target===editModal) editModal.classList.add("hidden"); });
 
-  function openEdit(id, q, cat, type) {
-    document.getElementById("editId").value  = id;
-    document.getElementById("editQ").value   = q;
-    document.getElementById("editCat").value = cat;
-    document.getElementById("editType").value= type || "question";
+  function openEdit(id){
+    var d = allDebates.find(function(x){ return x.id===id; });
+    if(!d) return;
+    currentEditId = id;
+    $("editQ").value   = d.question;
+    $("editCat").value = d.category || "General";
+    $("editType").value= d.type     || "question";
+    $("editErr").innerHTML = "";
     editModal.classList.remove("hidden");
-    document.getElementById("editQ").focus();
+    $("editQ").focus();
   }
 
-  document.getElementById("editSave").onclick = async () => {
-    const id  = document.getElementById("editId").value;
-    const q   = document.getElementById("editQ").value.trim();
-    const cat = document.getElementById("editCat").value;
-    const typ = document.getElementById("editType").value;
-    if(!q) return alert("Question cannot be empty");
-    const r = await api("/admin/debates/"+id, {method:"PATCH", body:JSON.stringify({question:q,category:cat,type:typ})});
-    if(r.error) return alert(r.error);
+  $("editSave").addEventListener("click", async function(){
+    var q   = $("editQ").value.trim();
+    var cat = $("editCat").value;
+    var typ = $("editType").value;
+    if(!q){ $("editErr").innerHTML='<div class="err-box">Question cannot be empty</div>'; return; }
+    var r = await req("/admin/debates/"+currentEditId, {method:"PATCH", body:JSON.stringify({question:q,category:cat,type:typ})});
+    if(r.error){ $("editErr").innerHTML='<div class="err-box">'+esc(r.error)+'</div>'; return; }
     editModal.classList.add("hidden");
-    await loadAll();
-  };
+    loadAll();
+  });
 
-  // ── All data state
-  let allDebates = [], allUsers = [], dailyData = [], statsData = {};
+  // ── State
+  var allDebates = [], allUsers = [], statsData = {};
 
-  async function loadAll() {
-    let d;
-    try {
-      const resp = await fetch("/admin/api/stats", {headers:{"content-type":"application/json"}});
-      const text = await resp.text();
-      try { d = JSON.parse(text); } catch(pe) {
-        document.getElementById("kpiRow").innerHTML =
-          '<div style="color:var(--no);font-size:13px">❌ Bad JSON from server: '+text.slice(0,120)+'</div>';
-        return;
-      }
-      if(!d || d.error) throw new Error(d?.error || "API error");
-    } catch(e) {
-      document.getElementById("kpiRow").innerHTML =
-        '<div style="color:var(--no);font-size:13px">❌ '+e.message+'</div>';
+  async function loadAll(){
+    var d = await req("/admin/api/stats");
+    if(!d || d.error){
+      $("kpiRow").innerHTML = '<div style="color:var(--no);font-size:13px">❌ '+(d&&d.error?esc(d.error):"Load failed")+'</div>';
       return;
     }
-    allDebates = d.top_debates || [];
+    allDebates = d.top_debates  || [];
     allUsers   = d.recent_users || [];
-    dailyData  = d.daily || [];
     statsData  = d;
-    try { renderKpis(); } catch(e) { document.getElementById("kpiRow").innerHTML='<div style="color:var(--no);font-size:13px">KPI error: '+e.message+'</div>'; }
-    try { renderChart(); } catch(e) { document.getElementById("chart").innerHTML='<div style="color:var(--no);font-size:13px">Chart error: '+e.message+'</div>'; }
-    try { renderDebatesTable(); } catch(e) { document.getElementById("debatesTable").innerHTML='<div style="color:var(--no);font-size:13px">Debates error: '+e.message+'</div>'; }
-    try { renderCategories(); } catch(e) { document.getElementById("categoriesPanel").innerHTML='<div style="color:var(--no);font-size:13px">Categories error: '+e.message+'</div>'; }
-    try { renderUsers(); } catch(e) { document.getElementById("usersTable").innerHTML='<div style="color:var(--no);font-size:13px">Users error: '+e.message+'</div>'; }
+    renderOverview();
+    renderDebates();
+    renderCategories();
+    renderUsers();
   }
 
-  function renderKpis() {
-    document.getElementById("kpiRow").innerHTML = [
-      [statsData.debates,         "Debates"],
-      [statsData.users,           "Users"],
-      [statsData.messages,        "Arguments"],
-      [statsData.total_views||0,  "Page Views"],
-      [statsData.unique_visitors||0, "Unique Visitors"],
-    ].map(([n,l]) =>
-      '<div class="kpi">' +
-      '<div class="kpi-n" '+(l==="Unique Visitors"?'style="color:var(--accent)"':'')+'>'+n+'</div>'+
-      '<div class="kpi-l">'+l+'</div></div>'
-    ).join("");
-  }
+  function renderOverview(){
+    $("kpiRow").innerHTML = [
+      [statsData.debates,           "Debates"],
+      [statsData.users,             "Users"],
+      [statsData.messages,          "Arguments"],
+      [statsData.total_views||0,    "Page Views"],
+      [statsData.unique_visitors||0,"Unique Visitors"],
+    ].map(function(pair){
+      return '<div class="kpi"><div class="kpi-n"'+(pair[1]==="Unique Visitors"?' style="color:var(--accent)"':'')+'>'+pair[0]+'</div><div class="kpi-l">'+pair[1]+'</div></div>';
+    }).join("");
 
-  function renderChart() {
-    const daily = dailyData.slice().reverse();
-    const maxV  = daily.length ? Math.max(...daily.map(r=>Number(r.uniq)||0), 1) : 1;
-    if(!daily.length) {
-      document.getElementById("chart").innerHTML =
-        '<div style="color:var(--muted);font-size:13px">No data yet — open your site first</div>';
-      return;
-    }
-    document.getElementById("chart").innerHTML = daily.map(r => {
-      const h    = Math.max(4, Math.round((Number(r.uniq)||0)/maxV*100));
-      const date = r.day ? new Date(r.day).toLocaleDateString("en-US",{month:"short",day:"numeric"}) : "?";
-      return '<div class="chart-col">' +
-        '<div class="chart-fill" style="height:'+h+'px" title="'+(r.uniq||0)+' unique"></div>' +
-        '<div class="chart-lbl">'+date+'</div></div>';
+    var daily = (statsData.daily||[]).slice().reverse();
+    if(!daily.length){ $("chartBar").innerHTML='<div style="color:var(--muted);font-size:13px">No data yet</div>'; return; }
+    var maxV = Math.max.apply(null, daily.map(function(r){ return Number(r.uniq)||0; }).concat([1]));
+    $("chartBar").innerHTML = daily.map(function(r){
+      var h    = Math.max(4, Math.round((Number(r.uniq)||0)/maxV*100));
+      var date = r.day ? new Date(r.day).toLocaleDateString("en-US",{month:"short",day:"numeric"}) : "?";
+      return '<div class="chart-col"><div class="chart-fill" style="height:'+h+'px" title="'+(r.uniq||0)+' unique"></div><div class="chart-lbl">'+date+'</div></div>';
     }).join("");
   }
 
-  function renderDebatesTable() {
-    if(!allDebates.length) {
-      document.getElementById("debatesTable").innerHTML =
-        '<div style="color:var(--muted);font-size:13px">No debates yet</div>';
-      return;
-    }
-    const rows = allDebates.map(dbt => {
-      const typeLabel = dbt.type === "event" ? "🌍" : "💭";
-      return '<tr class="debate-row" style="cursor:pointer" data-id="'+dbt.id+'">' +
-        '<td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(dbt.question||"")+'</td>' +
-        '<td>'+esc(dbt.category||"")+'</td>' +
-        '<td><span class="badge '+(dbt.type||"question")+'">'+typeLabel+' '+(dbt.type||"question")+'</span></td>' +
-        '<td>'+(dbt.arg_count||0)+'</td>' +
-        '<td>'+(dbt.views||0)+'</td>' +
-        '<td><span class="badge '+(dbt.active?"on":"off")+'">'+(dbt.active?"Active":"Hidden")+'</span></td>' +
-        '<td><div style="display:flex;gap:4px;flex-wrap:wrap">' +
-          '<button class="btn-sm btn-edit" onclick="event.stopPropagation();openEdit('+dbt.id+',allDebates.find(d=>d.id==='+dbt.id+').question,allDebates.find(d=>d.id==='+dbt.id+').category,allDebates.find(d=>d.id==='+dbt.id+').type)">✏️ Edit</button>' +
-          '<button class="btn-sm btn-success" onclick="event.stopPropagation();toggleDebate('+dbt.id+')">'+(dbt.active?"Hide":"Show")+'</button>' +
-          '<button class="btn-sm btn-danger" onclick="event.stopPropagation();delDebate('+dbt.id+')">🗑️</button>' +
-        '</div></td>' +
-      '</tr>' +
-      '<tr class="args-row" id="args-'+dbt.id+'"><td colspan="7" style="padding:0">' +
-        '<div class="args-inner" id="args-inner-'+dbt.id+'">' +
-          '<div style="color:var(--muted);font-size:13px;padding:10px 0">Click the row above to load arguments</div>' +
-        '</div></td></tr>';
-    }).join("");
-
-    document.getElementById("debatesTable").innerHTML =
-      '<table class="table"><thead><tr>' +
-      '<th>Question</th><th>Category</th><th>Type</th><th>Args</th><th>Views</th><th>Status</th><th>Actions</th>' +
-      '</tr></thead><tbody>'+rows+'</tbody></table>';
-
-    document.querySelectorAll(".debate-row").forEach(row => {
-      row.addEventListener("click", () => {
-        const id     = row.dataset.id;
-        const isOpen = row.classList.contains("open");
-        document.querySelectorAll(".debate-row").forEach(r => r.classList.remove("open"));
-        document.querySelectorAll(".args-row").forEach(r => r.classList.remove("open"));
-        if(!isOpen) {
-          row.classList.add("open");
-          document.getElementById("args-"+id).classList.add("open");
-          loadArgs(id);
-        }
-      });
+  function renderDebates(){
+    if(!allDebates.length){ $("debatesTable").innerHTML='<div style="color:var(--muted)">No debates yet</div>'; return; }
+    var html = '<table class="tbl"><thead><tr><th>Question</th><th>Category</th><th>Type</th><th>Args</th><th>Status</th><th>Actions</th></tr></thead><tbody>';
+    allDebates.forEach(function(d){
+      var typeBadge = d.type==="event"
+        ? '<span class="badge badge-event">🌍 event</span>'
+        : '<span class="badge badge-q">💭 question</span>';
+      var statusBadge = d.active
+        ? '<span class="badge badge-on">Active</span>'
+        : '<span class="badge badge-off">Hidden</span>';
+      html += '<tr>';
+      html += '<td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(d.question)+'</td>';
+      html += '<td>'+esc(d.category||"")+'</td>';
+      html += '<td>'+typeBadge+'</td>';
+      html += '<td>'+(d.arg_count||0)+'</td>';
+      html += '<td>'+statusBadge+'</td>';
+      html += '<td><div style="display:flex;gap:4px;flex-wrap:wrap">'
+        + '<button class="btn-sm btn-edit" onclick="openEdit('+d.id+')">✏️</button>'
+        + '<button class="btn-sm btn-success" onclick="toggleDebate('+d.id+')">'+(d.active?"Hide":"Show")+'</button>'
+        + '<button class="btn-sm btn-danger" onclick="delDebate('+d.id+')">🗑️</button>'
+        + '<button class="btn-sm" onclick="toggleArgs('+d.id+',this)">▶ args</button>'
+        + '</div></td>';
+      html += '</tr>';
+      html += '<tr id="args-row-'+d.id+'" class="args-hidden"><td colspan="6" style="padding:0;background:var(--bg3)">';
+      html += '<div id="args-inner-'+d.id+'" style="padding:0 10px 12px"><div style="color:var(--muted);font-size:12px;padding:10px 0">Click ▶ args to load</div></div>';
+      html += '</td></tr>';
     });
+    html += '</tbody></table>';
+    $("debatesTable").innerHTML = html;
   }
 
-  function renderCategories() {
-    // Group debates by category
-    const catMap = {};
-    allDebates.forEach(dbt => {
-      const c = dbt.category || "General";
-      if(!catMap[c]) catMap[c] = [];
-      catMap[c].push(dbt);
-    });
-    const cats = Object.keys(catMap).sort();
-    if(!cats.length) {
-      document.getElementById("categoriesPanel").innerHTML =
-        '<div style="color:var(--muted);font-size:13px">No categories yet</div>';
-      return;
+  function toggleArgs(id, btn){
+    var row = $("args-row-"+id);
+    if(row.classList.contains("args-hidden")){
+      row.classList.remove("args-hidden");
+      btn.textContent = "▼ args";
+      loadArgs(id);
+    } else {
+      row.classList.add("args-hidden");
+      btn.textContent = "▶ args";
     }
-    const ALL_CATS = ["Technology","Economy","Society","Politics","Education","Life","Work","General"];
-    document.getElementById("categoriesPanel").innerHTML = cats.map(cat => {
-      const items   = catMap[cat];
-      const targets = ALL_CATS.filter(c => c !== cat);
-      const selId   = "moveSel-"+cat.replace(/[^a-z0-9]/gi,"_");
-      const opts    = targets.map(c => '<option value="'+c+'">'+c+'</option>').join("");
-      const pills   = items.map(d =>
-        '<span class="cat-pill">'+esc(d.question.length>45 ? d.question.slice(0,45)+"…" : d.question)+'</span>'
-      ).join("");
-      return '<div class="cat-card">' +
-        '<div class="cat-card-header">' +
-          '<span class="cat-card-name">📁 '+esc(cat)+'</span>' +
-          '<span class="cat-card-count">'+items.length+' debate'+(items.length!==1?"s":"")+'</span>' +
-          '<select id="'+selId+'" style="padding:6px 10px;border-radius:8px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-size:12px;outline:none">'+opts+'</select>' +
-          '<button class="btn-sm btn-edit" onclick="moveCategory(\''+cat+'\',document.getElementById(\''+selId+'\').value)">Move all →</button>' +
-          '<button class="btn-sm btn-danger" onclick="deleteCategory(\''+cat+'\')">Delete category</button>' +
-        '</div>' +
-        '<div class="cat-pills">'+pills+'</div>' +
-      '</div>';
-    }).join("");
   }
 
-  function renderUsers() {
-    if(!allUsers.length) {
-      document.getElementById("usersTable").innerHTML =
-        '<div style="color:var(--muted);font-size:13px">No users yet</div>';
-      return;
-    }
-    const rows = allUsers.map(u =>
-      '<tr>' +
-      '<td><a href="/u/'+esc(u.username)+'" style="font-weight:600">'+esc(u.username)+'</a></td>' +
-      '<td><input type="number" value="'+u.rating+'" id="rat-'+esc(u.username)+'" style="width:70px;padding:4px 8px;border-radius:7px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-size:13px;text-align:center"/></td>' +
-      '<td>'+(u.arg_count||0)+'</td>' +
-      '<td style="color:var(--muted)">'+(u.created_at ? new Date(u.created_at).toLocaleDateString() : "—")+'</td>' +
-      '<td><div style="display:flex;gap:5px">' +
-        '<button class="btn-sm btn-edit" onclick="saveRating(\''+esc(u.username)+'\')">Save rating</button>' +
-        '<button class="btn-sm btn-danger" onclick="delUser(\''+esc(u.username)+'\')">Delete</button>' +
-      '</div></td>' +
-      '</tr>'
-    ).join("");
-    document.getElementById("usersTable").innerHTML =
-      '<table class="table"><thead><tr>' +
-      '<th>Username</th><th>Rating</th><th>Arguments</th><th>Joined</th><th>Actions</th>' +
-      '</tr></thead><tbody>'+rows+'</tbody></table>';
-  }
-
-  // ── Load arguments inline
-  async function loadArgs(debateId) {
-    const inner = document.getElementById("args-inner-"+debateId);
+  async function loadArgs(debateId){
+    var inner = $("args-inner-"+debateId);
     if(!inner) return;
-    inner.innerHTML = '<div style="color:var(--muted);font-size:13px;padding:10px 0">Loading…</div>';
-    let rows;
-    try { rows = await api("/debate/"+debateId+"/messages?limit=200&sort=new"); }
-    catch(e) { inner.innerHTML = '<div style="color:var(--no);font-size:13px">Error loading</div>'; return; }
-    if(!rows || !rows.length) {
-      inner.innerHTML = '<div style="color:var(--muted);font-size:13px;padding:10px 0">No arguments yet</div>';
+    inner.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:10px 0">Loading…</div>';
+    var msgs = await req("/debate/"+debateId+"/messages?limit=200&sort=new");
+    if(!msgs || msgs.error || !msgs.length){
+      inner.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:10px 0">No arguments yet</div>';
       return;
     }
-    inner.innerHTML = rows.map(m =>
-      '<div style="display:flex;align-items:flex-start;gap:10px;padding:10px 0;border-bottom:1px solid var(--border);">' +
-        '<span class="badge '+(m.side||"").toLowerCase()+'">'+(m.side||"")+'</span>' +
-        '<div style="flex:1;font-size:13px;color:rgba(234,237,243,.8);line-height:1.5">' +
-          '<span style="font-weight:600;font-size:12px">'+esc(m.username||"")+'</span>' +
-          '<span style="color:var(--muted);font-size:11px;margin:0 6px">score: '+m.score+'</span>' +
-          '<br/>'+esc(m.text||"")+'</div>' +
-        '<div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">' +
-          '<span style="font-size:11px;color:var(--muted)">'+new Date(m.created_at).toLocaleDateString()+'</span>' +
-          '<button class="btn-sm btn-danger" onclick="delMsg('+m.id+','+debateId+')">Delete</button>' +
-        '</div>' +
-      '</div>'
-    ).join("");
+    inner.innerHTML = msgs.map(function(m){
+      return '<div style="display:flex;align-items:flex-start;gap:10px;padding:10px 0;border-bottom:1px solid var(--border)">'
+        +'<span class="badge '+(m.side==="YES"?"badge-on":"badge-off")+'">'+m.side+'</span>'
+        +'<div style="flex:1;font-size:13px;line-height:1.5"><span style="font-weight:600;font-size:12px">'+esc(m.username)+'</span> <span style="color:var(--muted);font-size:11px">score:'+m.score+'</span><br>'+esc(m.text)+'</div>'
+        +'<div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">'
+        +'<span style="font-size:11px;color:var(--muted)">'+new Date(m.created_at).toLocaleDateString()+'</span>'
+        +'<button class="btn-sm btn-danger" onclick="delMsg('+m.id+','+debateId+')">Del</button>'
+        +'</div></div>';
+    }).join("");
   }
 
-  async function saveRating(username) {
-    const val = parseInt(document.getElementById("rat-"+username).value, 10);
-    if(!Number.isFinite(val)) return alert("Enter a valid number");
-    const r = await api("/admin/users/"+encodeURIComponent(username)+"/rating",
-      {method:"PATCH", body:JSON.stringify({rating:val})});
-    if(r.error) return alert(r.error);
-    await loadAll();
+  function renderCategories(){
+    var catMap = {};
+    allDebates.forEach(function(d){
+      var c = d.category||"General";
+      if(!catMap[c]) catMap[c]=[];
+      catMap[c].push(d);
+    });
+    var cats = Object.keys(catMap).sort();
+    if(!cats.length){ $("catPanel").innerHTML='<div style="color:var(--muted)">No categories</div>'; return; }
+    var ALL_CATS = ["Technology","Economy","Society","Politics","Education","Life","Work","General"];
+    var html = cats.map(function(cat){
+      var items   = catMap[cat];
+      var targets = ALL_CATS.filter(function(c){ return c!==cat; });
+      var selId   = "moveSel_"+cat.replace(/\W/g,"_");
+      var opts    = targets.map(function(c){ return '<option value="'+esc(c)+'">'+esc(c)+'</option>'; }).join("");
+      var pills   = items.map(function(d){
+        return '<span class="cat-pill">'+esc(d.question.length>42?d.question.slice(0,42)+"…":d.question)+'</span>';
+      }).join("");
+      return '<div class="cat-card">'
+        +'<div class="cat-header">'
+        +'<span class="cat-name">📁 '+esc(cat)+'</span>'
+        +'<span style="font-size:12px;color:var(--muted)">'+items.length+' debate'+(items.length!==1?"s":"")+'</span>'
+        +'<select id="'+selId+'" style="padding:6px 10px;border-radius:8px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-size:12px;outline:none">'+opts+'</select>'
+        +'<button class="btn-sm btn-edit" onclick="moveCategory(\''+esc(cat)+'\',document.getElementById(\''+selId+'\').value)">Move all →</button>'
+        +'<button class="btn-sm btn-danger" onclick="deleteCategory(\''+esc(cat)+'\')">Delete</button>'
+        +'</div>'
+        +'<div class="cat-pills">'+pills+'</div>'
+        +'</div>';
+    }).join("");
+    $("catPanel").innerHTML = html;
   }
-  async function delUser(username) {
-    if(!confirm('Delete user "'+username+'" and ALL their arguments and votes? Cannot be undone.')) return;
-    const r = await api("/admin/users/"+encodeURIComponent(username), {method:"DELETE"});
-    if(r.error) return alert(r.error);
-    await loadAll();
+
+  function renderUsers(){
+    if(!allUsers.length){ $("usersTable").innerHTML='<div style="color:var(--muted)">No users yet</div>'; return; }
+    var html = '<table class="tbl"><thead><tr><th>Username</th><th>Rating</th><th>Args</th><th>Joined</th><th>Actions</th></tr></thead><tbody>';
+    allUsers.forEach(function(u){
+      var uid = "rat_"+u.username.replace(/\W/g,"_");
+      html += '<tr>'
+        +'<td><a href="/u/'+esc(u.username)+'" style="font-weight:600">'+esc(u.username)+'</a></td>'
+        +'<td><input type="number" id="'+uid+'" value="'+u.rating+'" style="width:70px;padding:4px 8px;border-radius:7px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-size:13px;text-align:center"/></td>'
+        +'<td>'+(u.arg_count||0)+'</td>'
+        +'<td style="color:var(--muted)">'+(u.created_at?new Date(u.created_at).toLocaleDateString():"—")+'</td>'
+        +'<td><div style="display:flex;gap:4px">'
+        +'<button class="btn-sm btn-edit" onclick="saveRating(\''+esc(u.username)+'\',\''+uid+'\')">Save</button>'
+        +'<button class="btn-sm btn-danger" onclick="delUser(\''+esc(u.username)+'\')">Delete</button>'
+        +'</div></td></tr>';
+    });
+    html += '</tbody></table>';
+    $("usersTable").innerHTML = html;
   }
 
   // ── Actions
-  async function toggleDebate(id) {
-    await api("/admin/debates/"+id+"/toggle", {method:"POST"});
-    await loadAll();
+  async function toggleDebate(id){ await req("/admin/debates/"+id+"/toggle",{method:"POST"}); loadAll(); }
+  async function delDebate(id){
+    if(!confirm("Delete debate + all its arguments?")) return;
+    await req("/admin/debates/"+id,{method:"DELETE"}); loadAll();
   }
-  async function delDebate(id) {
-    if(!confirm("Delete this debate AND all its arguments? Cannot be undone.")) return;
-    await api("/admin/debates/"+id, {method:"DELETE"});
-    await loadAll();
-  }
-  async function delMsg(msgId, debateId) {
+  async function delMsg(msgId, debateId){
     if(!confirm("Delete this argument?")) return;
-    await api("/admin/messages/"+msgId, {method:"DELETE"});
-    await loadArgs(debateId);
+    await req("/admin/messages/"+msgId,{method:"DELETE"}); loadArgs(debateId);
   }
-  async function moveCategory(from, to) {
-    if(!to) return alert("Select a target category first");
-    if(!confirm('Move ALL debates from "'+from+'" → "'+to+'"?')) return;
-    const r = await api("/admin/category/"+encodeURIComponent(from),
-      {method:"DELETE", body:JSON.stringify({action:"move", target:to})});
+  async function moveCategory(from, to){
+    if(!to) return alert("Pick a target category");
+    if(!confirm("Move all debates from \""+from+"\" → \""+to+"\"?")) return;
+    var r = await req("/admin/category/"+encodeURIComponent(from),{method:"DELETE",body:JSON.stringify({action:"move",target:to})});
     if(r.error) return alert(r.error);
-    await loadAll();
+    loadAll();
   }
-  async function deleteCategory(name) {
-    if(!confirm('Delete category "'+name+'" and ALL its debates? Cannot be undone.')) return;
-    const r = await api("/admin/category/"+encodeURIComponent(name),
-      {method:"DELETE", body:JSON.stringify({action:"delete"})});
+  async function deleteCategory(name){
+    if(!confirm("Delete category \""+name+"\" AND all its debates? Cannot be undone.")) return;
+    var r = await req("/admin/category/"+encodeURIComponent(name),{method:"DELETE",body:JSON.stringify({action:"delete"})});
     if(r.error) return alert(r.error);
-    await loadAll();
+    loadAll();
+  }
+  async function saveRating(username, inputId){
+    var val = parseInt(document.getElementById(inputId).value,10);
+    if(isNaN(val)) return alert("Invalid number");
+    var r = await req("/admin/users/"+encodeURIComponent(username)+"/rating",{method:"PATCH",body:JSON.stringify({rating:val})});
+    if(r.error) return alert(r.error);
+    loadAll();
+  }
+  async function delUser(username){
+    if(!confirm("Delete user \""+username+"\" and ALL their data? Cannot be undone.")) return;
+    var r = await req("/admin/users/"+encodeURIComponent(username),{method:"DELETE"});
+    if(r.error) return alert(r.error);
+    loadAll();
   }
 
   // ── Add debate
-  document.getElementById("addBtn").addEventListener("click", async () => {
-    const question = document.getElementById("newQ").value.trim();
-    const category = document.getElementById("newCat").value;
-    const type     = document.getElementById("newType").value;
-    if(!question) return alert("Enter a question");
-    const r = await api("/admin/debates", {method:"POST", body:JSON.stringify({question,category,type})});
+  $("addBtn").addEventListener("click", async function(){
+    var q   = $("newQ").value.trim();
+    var cat = $("newCat").value;
+    var typ = $("newType").value;
+    if(!q) return alert("Enter a question");
+    var r = await req("/admin/debates",{method:"POST",body:JSON.stringify({question:q,category:cat,type:typ})});
     if(r.error) return alert(r.error);
-    document.getElementById("newQ").value = "";
-    await loadAll();
+    $("newQ").value = "";
+    loadAll();
   });
 
   loadAll();
@@ -2126,141 +2119,142 @@ function livePage() {
   return `<!doctype html><html lang="en">
 <head>
   <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Live Debates — ARGU</title>
+  <title>⚡ Live — ARGU</title>
   ${BASE_CSS}
   <style>
     body{overflow:hidden;}
-    .live-wrap{position:fixed;inset:0;display:flex;flex-direction:column;}
+    .wrap{position:fixed;inset:0;display:flex;flex-direction:column;}
     /* Nav */
-    .live-nav{display:flex;align-items:center;justify-content:space-between;padding:0 28px;height:56px;border-bottom:1px solid var(--border);background:rgba(11,12,16,.9);backdrop-filter:blur(18px);flex-shrink:0;z-index:10;}
+    .live-nav{display:flex;align-items:center;justify-content:space-between;padding:0 24px;height:54px;border-bottom:1px solid var(--border);background:rgba(11,12,16,.9);backdrop-filter:blur(18px);flex-shrink:0;z-index:10;}
     .live-badge{display:inline-flex;align-items:center;gap:6px;font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#ef4444;border:1px solid rgba(239,68,68,.35);background:rgba(239,68,68,.1);padding:4px 12px;border-radius:999px;}
-    .live-dot-red{width:6px;height:6px;border-radius:50%;background:#ef4444;animation:blink 1s infinite;}
-    @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
-    /* Main split */
-    .live-body{flex:1;display:grid;grid-template-columns:1fr 380px;overflow:hidden;}
-    @media(max-width:800px){.live-body{grid-template-columns:1fr;grid-template-rows:auto 1fr;}}
-    /* Left: question */
-    .live-left{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px;text-align:center;position:relative;overflow:hidden;border-right:1px solid var(--border);}
-    .live-category{font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin-bottom:16px;}
-    .live-q{font-family:'Unbounded',sans-serif;font-size:clamp(22px,3.5vw,44px);font-weight:900;letter-spacing:-0.03em;line-height:1.1;max-width:680px;margin-bottom:32px;transition:opacity .4s;}
+    .rdot{width:6px;height:6px;border-radius:50%;background:#ef4444;animation:rblink 1s infinite;display:inline-block;}
+    @keyframes rblink{0%,100%{opacity:1}50%{opacity:.2}}
+    /* Body split */
+    .live-body{flex:1;display:grid;grid-template-columns:1fr 360px;overflow:hidden;}
+    @media(max-width:760px){.live-body{grid-template-columns:1fr;}}
+    /* Left */
+    .left{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px 40px;text-align:center;border-right:1px solid var(--border);position:relative;overflow:hidden;}
+    /* Phase bar */
+    .phase-bar{display:flex;gap:0;width:100%;max-width:420px;margin-bottom:28px;border-radius:10px;overflow:hidden;border:1px solid var(--border);}
+    .phase-seg{flex:1;padding:6px 4px;font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);text-align:center;background:var(--bg3);transition:all .3s;}
+    .phase-seg.active{background:var(--accent);color:#fff;}
+    .phase-seg.done{background:rgba(59,130,246,.2);color:var(--accent);}
+    /* Question */
+    .live-cat{font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin-bottom:14px;}
+    .live-q{font-family:'Unbounded',sans-serif;font-size:clamp(20px,3vw,40px);font-weight:900;letter-spacing:-0.03em;line-height:1.1;max-width:640px;margin-bottom:28px;transition:opacity .35s;}
     .live-q.fade{opacity:0;}
-    /* Timer ring */
-    .timer-wrap{position:relative;width:80px;height:80px;margin:0 auto 28px;}
+    /* Timer */
+    .timer-wrap{position:relative;width:72px;height:72px;margin-bottom:24px;}
     .timer-svg{transform:rotate(-90deg);}
-    .timer-track{fill:none;stroke:var(--border);stroke-width:4;}
-    .timer-fill{fill:none;stroke:var(--accent);stroke-width:4;stroke-linecap:round;transition:stroke-dashoffset .9s linear,stroke 1s;}
-    .timer-n{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:'Unbounded',sans-serif;font-size:22px;font-weight:900;}
-    /* Vote buttons */
-    .vote-row{display:flex;gap:14px;margin-bottom:24px;}
-    .vote-btn{flex:1;max-width:160px;padding:16px 20px;border-radius:16px;border:2px solid;font-family:'Unbounded',sans-serif;font-size:14px;font-weight:700;cursor:pointer;transition:all .18s;position:relative;overflow:hidden;}
-    .vote-yes{border-color:var(--yes);background:var(--yes-dim);color:var(--yes);}
-    .vote-yes:hover,.vote-yes.picked{background:var(--yes);color:#fff;}
-    .vote-no{border-color:var(--no);background:var(--no-dim);color:var(--no);}
-    .vote-no:hover,.vote-no.picked{background:var(--no);color:#fff;}
-    /* Score bar */
-    .score-row{display:flex;align-items:center;gap:10px;width:100%;max-width:400px;font-family:'Unbounded',sans-serif;font-size:13px;font-weight:700;}
-    .score-yes{color:var(--yes);min-width:44px;text-align:right;}
-    .score-no{color:var(--no);min-width:44px;}
-    .score-bar{flex:1;height:6px;background:var(--bg3);border-radius:999px;overflow:hidden;}
-    .score-fill{height:100%;background:linear-gradient(90deg,var(--yes),var(--no));border-radius:999px;transition:width .6s ease;}
-    /* Arg form */
-    .arg-form{width:100%;max-width:440px;margin-top:20px;}
-    .arg-form textarea{width:100%;padding:12px 14px;border-radius:12px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-family:'Manrope',sans-serif;font-size:13px;resize:none;outline:none;min-height:70px;}
-    .arg-form textarea:focus{border-color:rgba(59,130,246,.5);}
-    .arg-form-row{display:flex;align-items:center;justify-content:space-between;margin-top:8px;}
-    /* Right: feed */
-    .live-right{display:flex;flex-direction:column;overflow:hidden;}
-    .feed-header{padding:16px 20px;border-bottom:1px solid var(--border);font-family:'Unbounded',sans-serif;font-size:11px;font-weight:700;letter-spacing:.05em;flex-shrink:0;display:flex;align-items:center;gap:8px;}
-    .feed-list{flex:1;overflow-y:auto;padding:12px 16px;display:flex;flex-direction:column;gap:8px;}
-    .feed-item{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:12px 14px;animation:slideIn .25s ease both;font-size:13px;}
-    @keyframes slideIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
-    .feed-item-head{display:flex;align-items:center;gap:6px;margin-bottom:6px;}
-    .feed-pill{display:inline-block;padding:2px 7px;border-radius:999px;font-size:9px;font-weight:700;letter-spacing:.07em;}
-    .feed-pill.yes{background:var(--yes-dim);color:var(--yes);border:1px solid rgba(59,130,246,.3);}
-    .feed-pill.no{background:var(--no-dim);color:var(--no);border:1px solid rgba(239,68,68,.3);}
-    .feed-author{font-size:11px;font-weight:600;color:var(--muted2);}
-    .feed-text{color:rgba(234,237,243,.82);line-height:1.5;}
-    /* Next debate preview */
-    .next-bar{padding:12px 20px;border-top:1px solid var(--border);font-size:12px;color:var(--muted);flex-shrink:0;display:flex;align-items:center;gap:8px;}
-    .next-q{color:var(--muted2);font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    .t-track{fill:none;stroke:var(--border);stroke-width:5;}
+    .t-fill{fill:none;stroke-width:5;stroke-linecap:round;transition:stroke-dashoffset 1s linear,stroke .5s;}
+    .t-n{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:'Unbounded',sans-serif;font-size:20px;font-weight:900;}
+    /* Phase content */
+    .phase-content{width:100%;max-width:420px;}
+    .phase-read-msg{font-size:16px;color:var(--muted2);line-height:1.5;}
+    .vote-row{display:flex;gap:12px;margin-bottom:18px;}
+    .vbtn{flex:1;max-width:150px;padding:15px;border-radius:14px;border:2px solid;font-family:'Unbounded',sans-serif;font-size:13px;font-weight:700;cursor:pointer;transition:all .18s;}
+    .vbtn-yes{border-color:var(--yes);background:var(--yes-dim);color:var(--yes);}
+    .vbtn-yes:hover,.vbtn-yes.picked{background:var(--yes);color:#fff;}
+    .vbtn-no{border-color:var(--no);background:var(--no-dim);color:var(--no);}
+    .vbtn-no:hover,.vbtn-no.picked{background:var(--no);color:#fff;}
+    .score-row{display:flex;align-items:center;gap:10px;width:100%;max-width:400px;font-family:'Unbounded',sans-serif;font-size:12px;font-weight:700;margin-bottom:16px;}
+    .sc-yes{color:var(--yes);min-width:50px;text-align:right;}
+    .sc-no{color:var(--no);min-width:50px;}
+    .sc-bar{flex:1;height:5px;background:var(--bg3);border-radius:999px;overflow:hidden;}
+    .sc-fill{height:100%;background:var(--yes);border-radius:999px;transition:width .5s;}
+    .arg-textarea{width:100%;padding:11px 13px;border-radius:10px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-family:'Manrope',sans-serif;font-size:13px;resize:none;outline:none;min-height:66px;transition:border-color .18s;}
+    .arg-textarea:focus{border-color:rgba(59,130,246,.5);}
+    /* Vote phase — inline argument voting */
+    .arg-vote-item{display:flex;align-items:flex-start;gap:10px;padding:10px 0;border-bottom:1px solid var(--border);}
+    .arg-vote-item:last-child{border-bottom:none;}
+    .arg-vote-btns{display:flex;flex-direction:column;gap:4px;align-items:center;}
+    .avbtn{width:28px;height:24px;border-radius:5px;border:1px solid var(--border);background:var(--bg3);color:var(--muted);font-size:11px;cursor:pointer;transition:all .15s;}
+    .avbtn.up:hover{background:var(--yes-dim);color:var(--yes);}
+    .avbtn.down:hover{background:var(--no-dim);color:var(--no);}
+    .avscore{font-family:'Unbounded',sans-serif;font-size:11px;font-weight:700;}
     /* Login overlay */
-    .login-overlay{position:absolute;inset:0;background:rgba(11,12,16,.85);backdrop-filter:blur(6px);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;z-index:5;border-radius:0;}
-    .login-overlay.hidden{display:none;}
+    .login-ov{position:absolute;inset:0;background:rgba(11,12,16,.88);backdrop-filter:blur(8px);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;z-index:5;}
+    .login-ov.hidden{display:none;}
+    /* Right: feed */
+    .right{display:flex;flex-direction:column;overflow:hidden;}
+    .feed-hdr{padding:14px 18px;border-bottom:1px solid var(--border);font-family:'Unbounded',sans-serif;font-size:11px;font-weight:700;display:flex;align-items:center;gap:8px;flex-shrink:0;}
+    .feed-list{flex:1;overflow-y:auto;padding:10px 14px;display:flex;flex-direction:column;gap:7px;}
+    .feed-item{background:var(--bg2);border:1px solid var(--border);border-radius:11px;padding:11px 13px;animation:fIn .2s ease both;font-size:13px;}
+    @keyframes fIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+    .fi-head{display:flex;align-items:center;gap:6px;margin-bottom:5px;}
+    .fi-pill{display:inline-block;padding:2px 7px;border-radius:999px;font-size:9px;font-weight:700;}
+    .fi-pill.yes{background:var(--yes-dim);color:var(--yes);border:1px solid rgba(59,130,246,.3);}
+    .fi-pill.no{background:var(--no-dim);color:var(--no);border:1px solid rgba(239,68,68,.3);}
+    .next-bar{padding:10px 18px;border-top:1px solid var(--border);font-size:11px;color:var(--muted);display:flex;align-items:center;gap:7px;flex-shrink:0;}
+    .next-q{color:var(--muted2);font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   </style>
 </head>
 <body>
-<div class="live-wrap">
+<div class="wrap">
   <nav class="live-nav">
-    <a class="logo" href="/">ARGU<span>.</span></a>
-    <div class="live-badge"><span class="live-dot-red"></span>LIVE</div>
+    <div style="display:flex;align-items:center;gap:14px">
+      <a href="/" style="font-size:13px;color:var(--muted2);display:flex;align-items:center;gap:5px">← Back</a>
+      <a class="logo" href="/">ARGU<span>.</span></a>
+    </div>
+    <div class="live-badge"><span class="rdot"></span>LIVE</div>
     <div id="navRight" style="font-size:13px;color:var(--muted2)"></div>
   </nav>
 
   <div class="live-body">
-    <!-- LEFT: question + voting -->
-    <div class="live-left" id="leftPane">
-      <div class="live-category" id="liveCategory">Loading…</div>
+    <!-- LEFT -->
+    <div class="left" id="leftPane">
+      <!-- Phase indicator -->
+      <div class="phase-bar" id="phaseBar">
+        <div class="phase-seg" id="seg-read">📖 Read</div>
+        <div class="phase-seg" id="seg-argue">⚔️ Argue</div>
+        <div class="phase-seg" id="seg-vote">🗳️ Vote</div>
+      </div>
+
+      <div class="live-cat" id="liveCategory">Loading…</div>
       <div class="live-q" id="liveQ"></div>
 
-      <!-- Timer -->
       <div class="timer-wrap">
-        <svg class="timer-svg" width="80" height="80" viewBox="0 0 80 80">
-          <circle class="timer-track" cx="40" cy="40" r="36"/>
-          <circle class="timer-fill" id="timerArc" cx="40" cy="40" r="36"
-            stroke-dasharray="226" stroke-dashoffset="0"/>
+        <svg class="timer-svg" width="72" height="72" viewBox="0 0 72 72">
+          <circle class="t-track" cx="36" cy="36" r="31"/>
+          <circle class="t-fill" id="tArc" cx="36" cy="36" r="31" stroke="#3b82f6"
+            stroke-dasharray="195" stroke-dashoffset="0"/>
         </svg>
-        <div class="timer-n" id="timerN">60</div>
+        <div class="t-n" id="tN">—</div>
       </div>
 
-      <!-- Score bar -->
-      <div class="score-row">
-        <span class="score-yes" id="scoreYes">0</span>
-        <div class="score-bar"><div class="score-fill" id="scoreFill" style="width:50%"></div></div>
-        <span class="score-no" id="scoreNo">0</span>
-      </div>
-
-      <!-- Vote buttons -->
-      <div class="vote-row" style="margin-top:20px;">
-        <button class="vote-btn vote-yes" id="voteYes" onclick="castVote('YES')">✓ YES</button>
-        <button class="vote-btn vote-no"  id="voteNo"  onclick="castVote('NO')">✗ NO</button>
-      </div>
-
-      <!-- Arg form (shown after voting) -->
-      <div class="arg-form hidden" id="argForm">
-        <textarea id="argText" placeholder="Optional: add your argument (max 300 chars)" maxlength="300"></textarea>
-        <div class="arg-form-row">
-          <span style="font-size:11px;color:var(--muted)" id="argHint">0 / 300</span>
-          <button onclick="postArg()" style="padding:9px 20px;border-radius:10px;border:none;background:var(--accent);color:#fff;font-family:'Unbounded',sans-serif;font-size:10px;font-weight:700;cursor:pointer;">Post →</button>
-        </div>
+      <!-- Phase-specific content -->
+      <div class="phase-content" id="phaseContent">
+        <div style="color:var(--muted);font-size:13px">Loading…</div>
       </div>
 
       <!-- Login overlay -->
-      <div class="login-overlay hidden" id="loginOverlay">
-        <div style="font-family:'Unbounded',sans-serif;font-size:16px;font-weight:700;margin-bottom:8px">Join to vote</div>
+      <div class="login-ov hidden" id="loginOv">
+        <div style="font-family:'Unbounded',sans-serif;font-size:16px;font-weight:700;margin-bottom:8px">Join to participate</div>
         <a href="/auth/google" style="display:inline-flex;align-items:center;gap:7px;padding:11px 20px;border-radius:12px;border:1px solid var(--border2);background:var(--bg3);color:var(--text);font-size:13px;font-weight:600;text-decoration:none;">
           <svg width="15" height="15" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.31-8.16 2.31-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
-          Google
+          Continue with Google
         </a>
         <div style="font-size:11px;color:var(--muted)">or</div>
         <div style="display:flex;gap:8px">
-          <input id="liveUser" placeholder="username…" maxlength="20" style="padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-size:13px;outline:none;width:160px;"/>
+          <input id="joinUser" placeholder="username…" maxlength="20" style="padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-size:13px;outline:none;width:140px;"/>
           <button onclick="quickJoin()" style="padding:10px 18px;border-radius:10px;border:none;background:var(--accent);color:#fff;font-family:'Unbounded',sans-serif;font-size:11px;font-weight:700;cursor:pointer;">Join</button>
         </div>
       </div>
     </div>
 
     <!-- RIGHT: live feed -->
-    <div class="live-right">
-      <div class="feed-header">
-        <span class="live-dot-red" style="width:7px;height:7px;border-radius:50%;background:#ef4444;animation:blink 1s infinite;display:inline-block;"></span>
-        Live arguments
-        <span id="feedCount" style="font-size:10px;color:var(--muted);margin-left:auto">0 arguments</span>
+    <div class="right">
+      <div class="feed-hdr">
+        <span class="rdot"></span>
+        Live feed
+        <span id="feedCount" style="font-size:10px;color:var(--muted);margin-left:auto">0 args</span>
       </div>
       <div class="feed-list" id="feedList">
         <div style="text-align:center;padding:40px;color:var(--muted);font-size:13px">Waiting for arguments…</div>
       </div>
       <div class="next-bar">
-        <span style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em">Next:</span>
+        <span style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;flex-shrink:0">Next:</span>
         <span class="next-q" id="nextQ">—</span>
       </div>
     </div>
@@ -2268,160 +2262,234 @@ function livePage() {
 </div>
 
 <script>
-  function esc(s){return String(s).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");}
-  async function api(url,opts={}){try{const r=await fetch(url,{headers:{"content-type":"application/json"},...opts});return r.json();}catch{return null;}}
+  function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+  async function api(url,opts){
+    try{
+      var r = await fetch(url, Object.assign({credentials:"same-origin",headers:{"content-type":"application/json"}},opts||{}));
+      return r.json();
+    }catch(e){ return null; }
+  }
 
-  let debates   = [];
-  let curIdx    = 0;
-  let me        = null;
-  let timerVal  = 60;
-  let timerInt  = null;
-  let pollInt   = null;
-  let pickedSide= null;
-  const ROUND_SEC = 60;
-  const CIRCUM    = 226; // 2*pi*36
+  var me         = null;
+  var curDebate  = null;
+  var curPhase   = "read";
+  var pickedSide = null;
+  var tickInt    = null;
+  var pollInt    = null;
+  var lastDebId  = null;
+  var lastPhase  = null;
+  var clientRem  = 0;
+  var CIRCUM     = 195;
 
-  async function init() {
-    const meR = await api("/me");
-    me = meR?.user || null;
-    if(me) document.getElementById("navRight").innerHTML =
-      '<a href="/u/'+esc(me.username)+'" style="font-weight:600;color:var(--text)">'+esc(me.username)+'</a>' +
-      '<span style="color:var(--gold);margin-left:6px">★'+me.rating+'</span>';
+  async function init(){
+    var meR = await api("/me");
+    me = meR && meR.user ? meR.user : null;
+    if(me){
+      document.getElementById("navRight").innerHTML =
+        '<a href="/u/'+esc(me.username)+'" style="font-weight:600;color:var(--text)">'+esc(me.username)+'</a>'+
+        '<span style="color:#f59e0b;margin-left:6px">★'+me.rating+'</span>';
+    }
+    poll();
+    pollInt = setInterval(poll, 4000);
+  }
 
-    debates = await api("/api/debates") || [];
-    if(!debates.length){
-      document.getElementById("liveCategory").textContent = "No debates yet";
-      document.getElementById("liveQ").textContent = "Add some debates in the admin panel.";
+  async function poll(){
+    var state = await api("/api/live-state");
+    if(!state || state.error){
+      document.getElementById("liveCategory").textContent = "No debates available";
+      document.getElementById("liveQ").textContent = "Add debates in the admin panel.";
       return;
     }
-    // shuffle
-    for(let i=debates.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[debates[i],debates[j]]=[debates[j],debates[i]];}
-    loadDebate(0);
-  }
 
-  function loadDebate(idx) {
-    curIdx    = idx % debates.length;
-    pickedSide= null;
-    timerVal  = ROUND_SEC;
-    clearInterval(timerInt);
-    clearInterval(pollInt);
+    var d = state.debate;
+    if(!d) return;
 
-    const d = debates[curIdx];
-    const next = debates[(curIdx+1) % debates.length];
+    // Detect debate change → reset side pick
+    if(d.id !== lastDebId){
+      pickedSide = null;
+      lastDebId  = d.id;
+      var qEl    = document.getElementById("liveQ");
+      qEl.classList.add("fade");
+      setTimeout(function(){
+        qEl.textContent = d.question;
+        document.getElementById("liveCategory").textContent = d.category || "General";
+        qEl.classList.remove("fade");
+      }, 350);
+      refreshFeed(d.id);
+    }
 
-    // Update UI
-    const qEl = document.getElementById("liveQ");
-    qEl.classList.add("fade");
-    setTimeout(()=>{
-      qEl.textContent = d.question;
-      document.getElementById("liveCategory").textContent = d.category || "General";
-      qEl.classList.remove("fade");
-    }, 400);
+    // Always update scores, timer, phase
+    curDebate = d;
+    curPhase  = state.phase;
+    clientRem = state.remaining;
 
-    document.getElementById("nextQ").textContent = next.question;
-    document.getElementById("argForm").classList.add("hidden");
-    document.getElementById("loginOverlay").classList.add("hidden");
-    document.getElementById("voteYes").classList.remove("picked");
-    document.getElementById("voteNo").classList.remove("picked");
-    document.getElementById("argText").value = "";
-
+    updatePhaseBar(state.phase);
+    updateTimer(state.remaining, state.duration, state.phase);
     updateScore(d.yes_count||0, d.no_count||0);
-    loadFeed(d.id);
 
-    // Timer
-    updateTimer(ROUND_SEC);
-    timerInt = setInterval(()=>{
-      timerVal--;
-      updateTimer(timerVal);
-      if(timerVal <= 0){ clearInterval(timerInt); nextDebate(); }
-    }, 1000);
+    if(state.phase !== lastPhase){
+      lastPhase = state.phase;
+      renderPhaseContent(state.phase, d);
+      if(state.phase === "vote" || state.phase === "argue") refreshFeed(d.id);
+    }
 
-    // Poll feed every 8s
-    pollInt = setInterval(()=>loadFeed(d.id), 8000);
+    if(state.next) document.getElementById("nextQ").textContent = state.next.question;
   }
 
-  function updateTimer(sec) {
-    const pct    = sec / ROUND_SEC;
-    const offset = CIRCUM * (1 - pct);
-    const arc    = document.getElementById("timerArc");
-    arc.style.strokeDashoffset = offset;
-    arc.style.stroke = sec > 20 ? "var(--accent)" : sec > 10 ? "#f59e0b" : "#ef4444";
-    document.getElementById("timerN").textContent = sec;
+  // Local 1s countdown between polls
+  clearInterval(tickInt);
+  tickInt = setInterval(function(){
+    if(clientRem > 0){
+      clientRem--;
+      if(curDebate) updateTimer(clientRem, getPhaseDuration(curPhase), curPhase);
+    }
+  }, 1000);
+
+  function getPhaseDuration(phase){
+    return phase==="read"?15:phase==="argue"?60:45;
   }
 
-  function updateScore(yes, no) {
-    const total = yes + no || 1;
-    const yp    = Math.round(yes/total*100);
-    document.getElementById("scoreYes").textContent = yes + " YES";
-    document.getElementById("scoreNo").textContent  = "NO " + no;
-    document.getElementById("scoreFill").style.width = yp+"%";
+  function updatePhaseBar(phase){
+    ["read","argue","vote"].forEach(function(p, i){
+      var seg = document.getElementById("seg-"+p);
+      var phases = ["read","argue","vote"];
+      var cur    = phases.indexOf(phase);
+      seg.classList.remove("active","done");
+      if(p === phase) seg.classList.add("active");
+      else if(phases.indexOf(p) < cur) seg.classList.add("done");
+    });
   }
 
-  async function loadFeed(debateId) {
-    const msgs = await api("/debate/"+debateId+"/messages?sort=new&limit=30");
+  function updateTimer(rem, dur, phase){
+    var pct    = dur > 0 ? rem/dur : 0;
+    var offset = CIRCUM * (1-pct);
+    var arc    = document.getElementById("tArc");
+    arc.setAttribute("stroke-dashoffset", offset);
+    var color  = rem > dur*0.5 ? "#3b82f6" : rem > dur*0.25 ? "#f59e0b" : "#ef4444";
+    arc.setAttribute("stroke", color);
+    document.getElementById("tN").textContent = rem;
+  }
+
+  function updateScore(yes, no){
+    var total = yes+no||1;
+    var yp    = Math.round(yes/total*100);
+    var scY   = document.getElementById("scY");
+    var scN   = document.getElementById("scN");
+    var scF   = document.getElementById("scF");
+    if(scY) scY.textContent = yes+" YES";
+    if(scN) scN.textContent = "NO "+no;
+    if(scF) scF.style.width = yp+"%";
+  }
+
+  function renderPhaseContent(phase, d){
+    var c = document.getElementById("phaseContent");
+    if(phase === "read"){
+      c.innerHTML = '<div class="phase-read-msg">Take a moment to think about both sides of this question. Voting starts in a few seconds.</div>';
+    } else if(phase === "argue"){
+      c.innerHTML =
+        '<div class="score-row"><span class="sc-yes" id="scY">0 YES</span><div class="sc-bar"><div class="sc-fill" id="scF" style="width:50%"></div></div><span class="sc-no" id="scN">NO 0</span></div>'+
+        '<div class="vote-row">'+
+          '<button class="vbtn vbtn-yes'+(pickedSide==="YES"?" picked":"")+'" id="btnYes" onclick="castVote(\'YES\')">✓ YES</button>'+
+          '<button class="vbtn vbtn-no'+(pickedSide==="NO"?" picked":"")+'" id="btnNo"  onclick="castVote(\'NO\')">✗ NO</button>'+
+        '</div>'+
+        '<div id="argSection" class="'+(pickedSide?'':'hidden')+'" style="width:100%">'+
+          '<textarea class="arg-textarea" id="argTxt" placeholder="Add your argument (optional, max 300 chars)" maxlength="300" oninput="document.getElementById(\'argHint\').textContent=this.value.length+\' / 300\'"></textarea>'+
+          '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px">'+
+            '<span style="font-size:11px;color:var(--muted)" id="argHint">0 / 300</span>'+
+            '<button onclick="postArg()" style="padding:9px 20px;border-radius:10px;border:none;background:var(--accent);color:#fff;font-family:\'Unbounded\',sans-serif;font-size:10px;font-weight:700;cursor:pointer">Post →</button>'+
+          '</div>'+
+        '</div>';
+      if(d) updateScore(d.yes_count||0, d.no_count||0);
+    } else if(phase === "vote"){
+      c.innerHTML =
+        '<div style="font-family:\'Unbounded\',sans-serif;font-size:13px;font-weight:700;margin-bottom:14px;width:100%;text-align:left">🗳️ Vote on the best arguments</div>'+
+        '<div id="voteArgList" style="width:100%;max-height:280px;overflow-y:auto"><div style="color:var(--muted);font-size:13px">Loading…</div></div>';
+      loadVoteArgs(d.id);
+    }
+  }
+
+  async function refreshFeed(debateId){
+    var msgs = await api("/debate/"+debateId+"/messages?sort=new&limit=40");
     if(!msgs || !msgs.length) return;
-    const d = debates[curIdx];
-    if(d.id !== debateId) return; // navigated away
-    // update counts
-    const yes = msgs.filter(m=>m.side==="YES").length;
-    const no  = msgs.filter(m=>m.side==="NO").length;
-    // Get full yes/no from debate data
-    const dr = await api("/api/debates");
-    if(dr){ const cur=dr.find(x=>x.id===debateId); if(cur) updateScore(cur.yes_count||0,cur.no_count||0); }
-
-    document.getElementById("feedCount").textContent = msgs.length+" argument"+(msgs.length!==1?"s":"");
-    document.getElementById("feedList").innerHTML = msgs.map(m=>
-      '<div class="feed-item">' +
-        '<div class="feed-item-head">' +
-          '<span class="feed-pill '+m.side.toLowerCase()+'">'+m.side+'</span>' +
-          '<span class="feed-author">'+esc(m.username)+'</span>' +
-          '<span style="margin-left:auto;font-size:10px;color:var(--muted)">'+
-            (m.score>0?'+':'')+m.score+' pts</span>' +
-        '</div>' +
-        '<div class="feed-text">'+esc(m.text)+'</div>' +
-      '</div>'
-    ).join("");
+    document.getElementById("feedCount").textContent = msgs.length+" arg"+(msgs.length!==1?"s":"");
+    document.getElementById("feedList").innerHTML = msgs.map(function(m){
+      return '<div class="feed-item">'+
+        '<div class="fi-head">'+
+          '<span class="fi-pill '+m.side.toLowerCase()+'">'+m.side+'</span>'+
+          '<span style="font-size:11px;font-weight:600;color:var(--muted2)">'+esc(m.username)+'</span>'+
+          '<span style="margin-left:auto;font-size:10px;color:var(--muted)">'+(m.score>0?"+":"")+m.score+'</span>'+
+        '</div>'+
+        '<div style="color:rgba(234,237,243,.82);line-height:1.5">'+esc(m.text)+'</div>'+
+      '</div>';
+    }).join("");
   }
 
-  async function castVote(side) {
-    if(!me){ document.getElementById("loginOverlay").classList.remove("hidden"); return; }
+  async function loadVoteArgs(debateId){
+    var msgs = await api("/debate/"+debateId+"/messages?sort=top&limit=20");
+    var el   = document.getElementById("voteArgList");
+    if(!el) return;
+    if(!msgs || !msgs.length){ el.innerHTML='<div style="color:var(--muted);font-size:13px">No arguments yet</div>'; return; }
+    el.innerHTML = msgs.map(function(m){
+      return '<div class="arg-vote-item">'+
+        '<div class="arg-vote-btns">'+
+          '<button class="avbtn up" onclick="voteMsg('+m.id+',1,this)">▲</button>'+
+          '<span class="avscore" style="color:'+(m.score>0?"var(--yes)":m.score<0?"var(--no)":"var(--muted)")+'">'+m.score+'</span>'+
+          '<button class="avbtn down" onclick="voteMsg('+m.id+',-1,this)">▼</button>'+
+        '</div>'+
+        '<div style="flex:1">'+
+          '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">'+
+            '<span class="fi-pill '+m.side.toLowerCase()+'">'+m.side+'</span>'+
+            '<span style="font-size:11px;font-weight:600;color:var(--muted2)">'+esc(m.username)+'</span>'+
+          '</div>'+
+          '<div style="font-size:13px;color:rgba(234,237,243,.82);line-height:1.5">'+esc(m.text)+'</div>'+
+        '</div>'+
+      '</div>';
+    }).join("");
+  }
+
+  async function castVote(side){
+    if(!me){ document.getElementById("loginOv").classList.remove("hidden"); return; }
     pickedSide = side;
-    document.getElementById("voteYes").classList.toggle("picked", side==="YES");
-    document.getElementById("voteNo").classList.toggle("picked",  side==="NO");
-    document.getElementById("argForm").classList.remove("hidden");
-    document.getElementById("argText").focus();
+    var btnY = document.getElementById("btnYes");
+    var btnN = document.getElementById("btnNo");
+    if(btnY) btnY.classList.toggle("picked", side==="YES");
+    if(btnN) btnN.classList.toggle("picked", side==="NO");
+    var argSec = document.getElementById("argSection");
+    if(argSec) argSec.classList.remove("hidden");
+    var at = document.getElementById("argTxt"); if(at) at.focus();
   }
 
-  async function postArg() {
-    if(!me || !pickedSide) return;
-    const text = document.getElementById("argText").value.trim();
+  async function postArg(){
+    if(!me || !pickedSide || !curDebate) return;
+    var text = (document.getElementById("argTxt")||{}).value||"";
+    text = text.trim();
     if(!text) return;
-    const d = debates[curIdx];
-    const r = await api("/debate/"+d.id+"/messages",{method:"POST",body:JSON.stringify({text,side:pickedSide})});
-    if(r?.error){ alert(r.error); return; }
-    document.getElementById("argText").value = "";
-    document.getElementById("argForm").classList.add("hidden");
-    await loadFeed(d.id);
+    var r = await api("/debate/"+curDebate.id+"/messages",{method:"POST",body:JSON.stringify({text:text,side:pickedSide})});
+    if(r && r.error){ alert(r.error); return; }
+    document.getElementById("argTxt").value="";
+    document.getElementById("argHint").textContent="0 / 300";
+    refreshFeed(curDebate.id);
   }
 
-  document.getElementById("argText").addEventListener("input", function(){
-    document.getElementById("argHint").textContent = this.value.length+" / 300";
-  });
+  async function voteMsg(msgId, value, btn){
+    if(!me){ document.getElementById("loginOv").classList.remove("hidden"); return; }
+    var r = await api("/messages/"+msgId+"/vote",{method:"POST",body:JSON.stringify({value:value})});
+    if(r && r.error && !r.error.includes("own")) alert(r.error);
+    if(curDebate) loadVoteArgs(curDebate.id);
+  }
 
-  async function quickJoin() {
-    const username = document.getElementById("liveUser").value.trim();
+  async function quickJoin(){
+    var username = document.getElementById("joinUser").value.trim();
     if(!username) return;
-    const r = await api("/auth/login",{method:"POST",body:JSON.stringify({username})});
-    if(r?.error){ alert(r.error); return; }
-    me = r.user;
-    document.getElementById("loginOverlay").classList.add("hidden");
-    document.getElementById("navRight").innerHTML =
-      '<a href="/u/'+esc(me.username)+'" style="font-weight:600;color:var(--text)">'+esc(me.username)+'</a>';
-    if(pickedSide) document.getElementById("argForm").classList.remove("hidden");
-  }
-
-  function nextDebate() {
-    loadDebate(curIdx + 1);
+    var r = await api("/auth/login",{method:"POST",body:JSON.stringify({username:username})});
+    if(r && r.error){ alert(r.error); return; }
+    me = r && r.user ? r.user : {username:username};
+    document.getElementById("loginOv").classList.add("hidden");
+    document.getElementById("navRight").innerHTML = '<span style="font-weight:600;color:var(--text)">'+esc(me.username)+'</span>';
+    if(curPhase==="argue" && pickedSide){
+      var argSec = document.getElementById("argSection");
+      if(argSec) argSec.classList.remove("hidden");
+    }
   }
 
   init();
