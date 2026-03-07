@@ -5,7 +5,7 @@ const { Client } = require("pg");
 async function run() {
   const client = new Client({
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.DATABASE_URL?.includes("render.com")
+    ssl: (process.env.DATABASE_URL || "").includes("render.com")
       ? { rejectUnauthorized: false }
       : undefined,
   });
@@ -15,8 +15,8 @@ async function run() {
     await client.query(fs.readFileSync("./db.sql", "utf8"));
     console.log("✅ Migration complete");
   } catch (err) {
-    console.error("❌ Migration failed:", err);
-    process.exitCode = 1;
+    console.error("❌ Migration failed:", err.message);
+    process.exit(1);
   } finally {
     await client.end().catch(() => {});
   }
