@@ -701,6 +701,10 @@ nav{position:sticky;top:0;z-index:100;border-bottom:1px solid var(--border);back
 
 const SHARED_JS = `
 <div id="toast-wrap"></div>
+<div id="warmup-banner" style="display:none;position:fixed;top:56px;left:0;right:0;z-index:200;background:#1a1a2e;border-bottom:1px solid rgba(59,130,246,.3);padding:11px 22px;align-items:center;justify-content:center;gap:11px;font-size:13px;color:var(--text2)">
+  <svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="#3b82f6" stroke-width="2" stroke-dasharray="20" stroke-linecap="round"><animateTransform attributeName="transform" type="rotate" from="0 8 8" to="360 8 8" dur="0.9s" repeatCount="indefinite"/></circle></svg>
+  <span>Server warming up (free tier cold start ~20s) — retrying automatically…</span>
+</div>
 <script>
 function toast(msg,type){
   var w=document.getElementById('toast-wrap');
@@ -712,27 +716,29 @@ function toast(msg,type){
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function ago(ts){var s=Math.floor((Date.now()-new Date(ts))/1000);if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago';}
 function badge(r){if(r>=500)return'💎';if(r>=200)return'🥇';if(r>=100)return'🥈';if(r>=25)return'🥉';return'';}
-async function api(url,opts,ms){
-  ms=ms||18000;
-  var ctrl=new AbortController();
-  var tid=setTimeout(function(){ctrl.abort();},ms);
-  try{
-    var r=await fetch(url,Object.assign({credentials:'same-origin',headers:{'content-type':'application/json'},signal:ctrl.signal},opts||{}));
-    clearTimeout(tid);
-    var t=await r.text();
-    try{return JSON.parse(t);}catch(e){return{error:'Parse error'};}
-  }catch(e){
-    clearTimeout(tid);
-    if(e.name==='AbortError'){
-      // Retry once after cold start
-      try{
-        var r2=await fetch(url,Object.assign({credentials:'same-origin',headers:{'content-type':'application/json'}},opts||{}));
-        var t2=await r2.text();
-        try{return JSON.parse(t2);}catch(e2){return{error:'Parse error'};}
-      }catch(e3){return null;}
+async function api(url,opts){
+  // Try up to 3 times with increasing timeouts
+  var delays=[8000,20000,40000];
+  for(var attempt=0;attempt<delays.length;attempt++){
+    var ctrl=new AbortController();
+    var tid=setTimeout(function(){ctrl.abort();},delays[attempt]);
+    try{
+      var r=await fetch(url,Object.assign({credentials:'same-origin',headers:{'content-type':'application/json'},signal:ctrl.signal},opts||{}));
+      clearTimeout(tid);
+      var t=await r.text();
+      try{return JSON.parse(t);}catch(e){return{error:'Parse error'};}
+    }catch(e){
+      clearTimeout(tid);
+      if(e.name!=='AbortError') return null;
+      // timed out - show warming up and retry
+      var wb=document.getElementById('warmup-banner');
+      if(wb){wb.style.display='flex';}
+      if(attempt<delays.length-1){
+        await new Promise(function(res){setTimeout(res,1000);});
+      }
     }
-    return null;
   }
+  return null;
 }
 function toggleTheme(){
   var isL=document.documentElement.getAttribute('data-theme')==='light';
@@ -916,8 +922,18 @@ async function loadNav(){
 }
 
 async function loadStats(){
-  var debates=await api('/api/debates?sort=hot');
-  if(!debates||!debates.length) return;
+  var debates=null;
+  for(var i=0;i<3;i++){
+    debates=await api('/api/debates?sort=hot');
+    if(debates&&debates.length) break;
+    if(i<2) await new Promise(function(r){setTimeout(r,3000);});
+  }
+  var wb=document.getElementById('warmup-banner');if(wb)wb.style.display='none';
+  if(!debates||!debates.length){
+    document.getElementById('widget').innerHTML='<div style="text-align:center;padding:20px;color:var(--muted);font-size:13px">Could not load — <button onclick="loadStats()" style="color:var(--accent);border:none;background:none;cursor:pointer;font-size:13px">retry</button></div>';
+    document.getElementById('preGrid').innerHTML='<div style="color:var(--muted);font-size:13px;text-align:center;padding:24px;grid-column:1/-1">Could not load debates — <button onclick="loadStats()" style="color:var(--accent);border:none;background:none;cursor:pointer;font-size:13px">retry</button></div>';
+    return;
+  }
   var totalArgs=debates.reduce(function(s,d){return s+(d.arg_count||0);},0);
   document.getElementById('sD').textContent=debates.length;
   document.getElementById('sA').textContent=totalArgs>=1000?(Math.round(totalArgs/100)/10)+'k':totalArgs;
@@ -1130,7 +1146,13 @@ function buildFilters(){
 }
 
 async function loadDebates(){
-  var data=await api('/api/debates?sort='+curSort)||[];
+  var data=await api('/api/debates?sort='+curSort);
+  var wb=document.getElementById('warmup-banner');if(wb)wb.style.display='none';
+  if(!data){
+    document.getElementById('evCol').innerHTML='<div class="empty-col">Could not connect — <a href="#" onclick="loadDebates();return false;" style="color:var(--accent)">retry</a></div>';
+    document.getElementById('quCol').innerHTML='<div class="empty-col">Could not connect — <a href="#" onclick="loadDebates();return false;" style="color:var(--accent)">retry</a></div>';
+    return;
+  }
   allDebates=data; buildFilters(); renderCols();
 }
 
@@ -1975,7 +1997,13 @@ function addFeedMsg(m){
 var pollInt=null;
 async function pollLive(){
   var state=await api('/api/live-state');
-  if(!state||state.error) return;
+  var wb=document.getElementById('warmup-banner');
+  if(!state||state.error){
+    if(wb)wb.style.display='flex';
+    document.getElementById('phaseLabel').textContent='Warming up…';
+    return;
+  }
+  if(wb)wb.style.display='none';
   liveState=state;
   if(state.debate){
     if(debateId!==state.debate.id){
@@ -2161,8 +2189,17 @@ function hideErr(){var eb=document.getElementById('errBox');if(eb)eb.style.displ
 
 async function doLogin(){
   var pw=(document.getElementById('pwIn')||{}).value||'';
+  var btn=document.querySelector('#loginView .btn-blue');
+  var errEl=document.getElementById('loginErr');
+  if(btn){btn.disabled=true;btn.textContent='Connecting…';}
+  if(errEl){errEl.textContent='';}
   var r=await api('/admin/login',{method:'POST',body:JSON.stringify({password:pw})});
-  if(!r||r.error){document.getElementById('loginErr').textContent=r&&r.error?r.error:'Wrong password';return;}
+  if(btn){btn.disabled=false;btn.textContent='Sign in →';}
+  if(!r){
+    if(errEl)errEl.textContent='Server warming up, please try again';
+    return;
+  }
+  if(r.error){if(errEl)errEl.textContent=r.error;return;}
   document.getElementById('loginView').style.display='none';
   document.getElementById('dashView').style.display='block';
   document.getElementById('navRight').innerHTML='<span style="font-size:12px;color:var(--muted2)">Admin</span><button class="theme-btn" id="themeBtn" onclick="toggleTheme()">☀️</button>';
@@ -2177,25 +2214,36 @@ async function doLogout(){
 }
 
 async function checkSession(){
-  var r=await api('/admin/api/stats');
-  if(r&&!r.error){
-    document.getElementById('loginView').style.display='none';
-    document.getElementById('dashView').style.display='block';
-    document.getElementById('navRight').innerHTML='<span style="font-size:12px;color:var(--muted2)">Admin</span><button class="theme-btn" id="themeBtn" onclick="toggleTheme()">☀️</button>';
-    renderStats(r);
-    loadDebatesPanel();
-    loadUsersPanel();
-  }
+  // Don't block login screen with a cold-start check - just show login
+  // (doLogin will handle warm-up messaging)
+  // But still check silently with short timeout
+  var ctrl=new AbortController();
+  var tid=setTimeout(function(){ctrl.abort();},5000);
+  try{
+    var r=await fetch('/admin/api/stats',{credentials:'same-origin',headers:{'content-type':'application/json'},signal:ctrl.signal});
+    clearTimeout(tid);
+    var data=JSON.parse(await r.text());
+    if(data&&!data.error){
+      document.getElementById('loginView').style.display='none';
+      document.getElementById('dashView').style.display='block';
+      document.getElementById('navRight').innerHTML='<span style="font-size:12px;color:var(--muted2)">Admin</span><button class="theme-btn" id="themeBtn" onclick="toggleTheme()">☀️</button>';
+      renderStats(data);
+      loadDebatesPanel();
+      loadUsersPanel();
+    }
+  }catch(e){clearTimeout(tid);/* not logged in or cold start, just show login form */}
 }
 
 async function loadAll(){
   hideErr();
+  var wb=document.getElementById('warmup-banner');if(wb)wb.style.display='flex';
   try{
     var r=await api('/admin/api/stats');
-    if(!r){showErr('Server not responding — the DB might be warming up.');return;}
+    if(wb)wb.style.display='none';
+    if(!r){showErr('Server not responding — the DB is warming up. Click Retry in ~20 seconds.');return;}
     if(r.error){showErr('Error: '+r.error);return;}
     renderStats(r);
-  }catch(e){showErr('JS Error: '+e.message);return;}
+  }catch(e){if(wb)wb.style.display='none';showErr('JS Error: '+e.message);return;}
   loadDebatesPanel();
   loadUsersPanel();
 }
