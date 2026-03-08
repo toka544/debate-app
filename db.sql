@@ -116,10 +116,49 @@ BEGIN
   END IF;
 END $$;
 
+-- ─────────────────────────────────────────
+-- BACKFILL DEFAULT DEBATES (if some were deleted)
+-- ─────────────────────────────────────────
+INSERT INTO debates (question, category, type)
+SELECT v.question, v.category, 'question'
+FROM (
+  VALUES
+    ('Is college a scam?',                              'Education'),
+    ('Should billionaires exist?',                      'Economy'),
+    ('Is democracy failing?',                           'Politics'),
+    ('Will AI replace programmers?',                    'Technology'),
+    ('Is remote work better than office work?',         'Work'),
+    ('Is hustle culture toxic?',                        'Society'),
+    ('Should governments regulate AI?',                 'Technology'),
+    ('Is capitalism broken?',                           'Economy'),
+    ('Will humans merge with AI in the future?',        'Technology'),
+    ('Should social media be banned for kids?',         'Society'),
+    ('Is happiness more important than success?',       'Life'),
+    ('Are smartphones destroying attention spans?',     'Society'),
+    ('Should AI have legal rights?',                    'Technology'),
+    ('Is freedom of speech absolute?',                  'Politics'),
+    ('Should universal basic income be implemented?',   'Economy'),
+    ('Is social media doing more harm than good?',      'Society'),
+    ('Should people be judged by their past mistakes?', 'Life'),
+    ('Should privacy be sacrificed for security?',      'Politics'),
+    ('Is discipline more important than talent?',       'Life'),
+    ('Is modern society becoming weaker?',              'Society')
+) AS v(question, category)
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM debates d
+  WHERE lower(trim(d.question)) = lower(trim(v.question))
+);
+
 -- Profile customization columns
 ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT DEFAULT '⚔️';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS headline TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS interests TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS birth_date DATE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS location TEXT;
 
 -- Update debate types for seeded debates
 UPDATE debates SET type = 'question' WHERE type IS NULL OR type = '';

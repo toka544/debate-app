@@ -18,7 +18,13 @@ if (!process.env.DATABASE_URL) {
   process.exit(1);
 }
 
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
+const ADMIN_PASSWORDS = [
+  process.env.ADMIN_PASSWORD,
+  process.env.ADMIN_PASS,
+  process.env.ADMIN_PWD,
+].filter((v) => typeof v === "string" && v.trim().length > 0);
+if (!ADMIN_PASSWORDS.length) ADMIN_PASSWORDS.push("admin123");
+const ADMIN_SESSION_VALUE = ADMIN_PASSWORDS[0];
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -29,7 +35,7 @@ const pool = new Pool({
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 5_000,
 });
-pool.on("error", (err) => console.error("🔴 DB error:", err.message));
+pool.on("error", (err) => console.error("🔴 DB error:", formatDbError(err)));
 
 // ─────────────────────────────────────────────────────────
 // Helpers
@@ -42,6 +48,41 @@ function esc(s) {
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
+}
+
+function parseAvatarDataUrl(value) {
+  if (value === undefined) return { provided: false, value: null };
+  if (value === null) return { provided: true, value: null };
+  const raw = String(value).trim();
+  if (!raw) return { provided: true, value: null };
+
+  const m = raw.match(/^data:image\/(png|jpe?g|webp|gif);base64,([A-Za-z0-9+/=]+)$/i);
+  if (!m) {
+    return {
+      provided: true,
+      error: "Avatar image must be PNG, JPG, WEBP or GIF",
+    };
+  }
+  const bytes = Buffer.byteLength(m[2], "base64");
+  if (bytes > 350 * 1024) {
+    return { provided: true, error: "Avatar image max size is 350KB" };
+  }
+  const ext = m[1].toLowerCase() === "jpg" ? "jpeg" : m[1].toLowerCase();
+  return { provided: true, value: `data:image/${ext};base64,${m[2]}` };
+}
+
+function formatDbError(err) {
+  if (!err) return "Unknown database error";
+  if (Array.isArray(err.errors) && err.errors.length) {
+    return err.errors
+      .map((e) =>
+        [e.code, e.address && e.port ? `${e.address}:${e.port}` : "", e.message]
+          .filter(Boolean)
+          .join(" ")
+      )
+      .join(" | ");
+  }
+  return err.message || err.code || String(err);
 }
 
 async function getMe(req) {
@@ -79,7 +120,7 @@ function trackView(req, res, path) {
 
 // Admin auth middleware
 function requireAdmin(req, res, next) {
-  if (req.cookies?.admin_session === ADMIN_PASSWORD) return next();
+  if (req.cookies?.admin_session === ADMIN_SESSION_VALUE) return next();
   return res.status(401).json({ error: "Unauthorized" });
 }
 
@@ -203,16 +244,24 @@ app.get("/auth/google/callback", wrap(async (req, res) => {
 // API: debates
 // ─────────────────────────────────────────────────────────
 app.get("/api/debates", wrap(async (req, res) => {
+  const sort = String(req.query.sort || "hot").toLowerCase();
+  const orderBy = sort === "new"
+    ? "d.created_at DESC, d.id DESC"
+    : sort === "top"
+      ? "arg_count DESC, d.id DESC"
+      : "recent_count DESC, arg_count DESC, d.id DESC";
+
   const r = await pool.query(`
     SELECT d.id, d.question, d.category, d.type,
            COUNT(m.id)::int                                AS arg_count,
+           COUNT(CASE WHEN m.created_at >= NOW() - INTERVAL '24 hours' THEN 1 END)::int AS recent_count,
            COUNT(CASE WHEN m.side='YES' THEN 1 END)::int   AS yes_count,
            COUNT(CASE WHEN m.side='NO'  THEN 1 END)::int   AS no_count
     FROM   debates d
     LEFT   JOIN messages m ON m.debate_id = d.id
     WHERE  d.active = TRUE
     GROUP  BY d.id
-    ORDER  BY d.id DESC
+    ORDER  BY ${orderBy}
   `);
   res.json(r.rows);
 }));
@@ -386,7 +435,7 @@ app.post("/messages/:id/react", reactionLimiter, wrap(async (req, res) => {
 app.get("/api/user/:username", wrap(async (req, res) => {
   const username = req.params.username;
   const userR = await pool.query(
-    "SELECT id, username, display_name, bio, avatar, rating, created_at FROM users WHERE username=$1",
+    "SELECT id, username, display_name, bio, avatar, avatar_url, interests, to_char(birth_date,'YYYY-MM-DD') AS birth_date, location, headline, rating, created_at FROM users WHERE username=$1",
     [username]
   );
   if (!userR.rows[0]) return res.status(404).json({ error: "User not found" });
@@ -414,9 +463,9 @@ app.get("/api/user/:username", wrap(async (req, res) => {
 // ─────────────────────────────────────────────────────────
 app.post("/admin/login", (req, res) => {
   const password = req.body?.password || "";
-  if (password !== ADMIN_PASSWORD)
+  if (!ADMIN_PASSWORDS.includes(password))
     return res.status(401).json({ error: "Wrong password" });
-  res.cookie("admin_session", ADMIN_PASSWORD, { httpOnly: true, sameSite: "lax" });
+  res.cookie("admin_session", ADMIN_SESSION_VALUE, { httpOnly: true, sameSite: "lax" });
   res.json({ success: true });
 });
 
@@ -554,7 +603,7 @@ app.get("/api/live-state", wrap(async (req, res) => {
 
   // fetch debate details
   const [curR, nextR] = await Promise.all([
-    pool.query(`SELECT d.id,d.question,d.category,
+    pool.query(`SELECT d.id,d.question,d.category,d.type,
       COUNT(CASE WHEN m.side='YES' THEN 1 END)::int AS yes_count,
       COUNT(CASE WHEN m.side='NO'  THEN 1 END)::int AS no_count
       FROM debates d LEFT JOIN messages m ON m.debate_id=d.id
@@ -585,11 +634,21 @@ app.patch("/api/profile", wrap(async(req,res)=>{
   const me = await getMe(req); if(!me) return res.status(401).json({error:"Login first"});
   const display_name = (req.body?.display_name||"").trim().slice(0,40)||null;
   const bio = (req.body?.bio||"").trim().slice(0,200)||null;
+  const headline = (req.body?.headline||"").trim().slice(0,80)||null;
+  const interests = (req.body?.interests||"").trim().slice(0,180)||null;
+  const location = (req.body?.location||"").trim().slice(0,60)||null;
+  let birth_date = null;
+  if (req.body?.birth_date) {
+    const bd = String(req.body.birth_date).slice(0, 10);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(bd)) birth_date = bd;
+  }
   const AVATARS=["⚔️","🔥","🧠","🎯","👑","🌍","⚡","🦁","🐺","🦊","🤖","💎","🥊","🎭","🌊","🦋"];
   const avatar = AVATARS.includes(req.body?.avatar) ? req.body.avatar : null;
+  const avatarUpload = parseAvatarDataUrl(req.body?.avatar_url);
+  if (avatarUpload.error) return res.status(400).json({ error: avatarUpload.error });
   await pool.query(
-    "UPDATE users SET display_name=COALESCE($1,display_name), bio=COALESCE($2,bio), avatar=COALESCE($3,avatar) WHERE id=$4",
-    [display_name, bio, avatar, me.id]
+    "UPDATE users SET display_name=$1, bio=$2, avatar=COALESCE($3,avatar), headline=$4, interests=$5, birth_date=$6, location=$7, avatar_url=CASE WHEN $8 THEN $9 ELSE avatar_url END WHERE id=$10",
+    [display_name, bio, avatar, headline, interests, birth_date, location, avatarUpload.provided, avatarUpload.value, me.id]
   );
   res.json({success:true});
 }));
@@ -858,7 +917,10 @@ ${SHARED_JS}
 
 <div class="ticker" id="tickerWrap">
   <div class="ticker-track" id="tickerTrack">
-    ${["Is college a scam?","Should billionaires exist?","Will AI replace programmers?","Is democracy failing?","Is hustle culture toxic?","Should AI have legal rights?","Is capitalism broken?","Is remote work better?","Should social media be banned for kids?","Is freedom of speech absolute?","Is happiness more important than success?","Are smartphones destroying attention spans?"].flatMap(q=>[q,q]).map(q=>`<span class="ticker-item"><span class="tdot"></span>${esc(q)}</span>`).join("")}
+    ${(() => {
+      const tqs = ["Is college a scam?","Should billionaires exist?","Will AI replace programmers?","Is democracy failing?","Is hustle culture toxic?","Should AI have legal rights?","Is capitalism broken?","Is remote work better?","Should social media be banned for kids?","Is freedom of speech absolute?","Is happiness more important than success?","Are smartphones destroying attention spans?"];
+      return tqs.concat(tqs).map(q => `<span class="ticker-item"><span class="tdot"></span>${esc(q)}</span>`).join("");
+    })()}
   </div>
 </div>
 
@@ -919,11 +981,11 @@ async function loadStats(){
   var debates=null;
   for(var i=0;i<3;i++){
     debates=await api('/api/debates?sort=hot');
-    if(debates&&debates.length) break;
+    if(Array.isArray(debates)&&debates.length) break;
     if(i<2) await new Promise(function(r){setTimeout(r,3000);});
   }
   var wb=document.getElementById('warmup-banner');if(wb)wb.style.display='none';
-  if(!debates||!debates.length){
+  if(!Array.isArray(debates)||!debates.length){
     document.getElementById('widget').innerHTML='<div style="text-align:center;padding:20px;color:var(--muted);font-size:13px">Could not load — <button onclick="loadStats()" style="color:var(--accent);border:none;background:none;cursor:pointer;font-size:13px">retry</button></div>';
     document.getElementById('preGrid').innerHTML='<div style="color:var(--muted);font-size:13px;text-align:center;padding:24px;grid-column:1/-1">Could not load debates — <button onclick="loadStats()" style="color:var(--accent);border:none;background:none;cursor:pointer;font-size:13px">retry</button></div>';
     return;
@@ -932,10 +994,13 @@ async function loadStats(){
   document.getElementById('sD').textContent=debates.length;
   document.getElementById('sA').textContent=totalArgs>=1000?(Math.round(totalArgs/100)/10)+'k':totalArgs;
   var lb=await api('/leaderboard/users?limit=1000');
-  if(lb) document.getElementById('sU').textContent=lb.length;
+  if(Array.isArray(lb)) document.getElementById('sU').textContent=lb.length;
 
   // Update ticker with real debates
-  var names=debates.map(function(d){return d.question;}).slice(0,12);
+  var fallbackTicker=["Is college a scam?","Should billionaires exist?","Will AI replace programmers?","Is democracy failing?","Is hustle culture toxic?","Should AI have legal rights?","Is capitalism broken?","Is remote work better?","Should social media be banned for kids?","Is freedom of speech absolute?","Is happiness more important than success?","Are smartphones destroying attention spans?"];
+  var names=[...new Set(debates.map(function(d){return d.question;}).filter(Boolean))];
+  fallbackTicker.forEach(function(q){if(names.length<12&&!names.includes(q))names.push(q);});
+  names=names.slice(0,12);
   var doubled=names.concat(names);
   document.getElementById('tickerTrack').innerHTML=doubled.map(function(q){return '<span class="ticker-item"><span class="tdot"></span>'+esc(q)+'</span>';}).join('');
 
@@ -956,22 +1021,22 @@ function renderWidget(step){
   var d=qDebate, total=d.yes_count+d.no_count;
   if(step==='pick'){
     w.innerHTML='<div class="widget-q">'+esc(d.question)+'</div>'
-      +'<div class="wbtns"><button class="wbtn wbtn-y" onclick="pickSide(\'YES\')">✓ YES</button><button class="wbtn wbtn-n" onclick="pickSide(\'NO\')">✗ NO</button></div>'
+      +'<div class="wbtns"><button class="wbtn wbtn-y" onclick="pickSide(&quot;YES&quot;)">✓ YES</button><button class="wbtn wbtn-n" onclick="pickSide(&quot;NO&quot;)">✗ NO</button></div>'
       +'<div class="widget-hint">'+total.toLocaleString()+' people have weighed in · <a href="/debate/'+d.id+'" style="color:var(--accent)">See all →</a></div>';
   }else if(step==='write'){
     var sc=qSide==='YES'?'var(--yes)':'var(--no)', bg=qSide==='YES'?'var(--yes-dim)':'var(--no-dim)';
     w.innerHTML='<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px"><span style="font-size:10px;font-weight:700;padding:3px 10px;border-radius:999px;background:'+bg+';color:'+sc+';border:1px solid '+sc+'">'+qSide+'</span><span class="widget-q" style="margin:0;font-size:13px">'+esc(d.question)+'</span></div>'
-      +'<textarea id="wTa" placeholder="Your argument… (max 300)" maxlength="300" style="width:100%;min-height:78px;padding:11px 13px;border-radius:11px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-family:\'Manrope\',sans-serif;font-size:13px;resize:none;outline:none;transition:border-color .16s" onfocus="this.style.borderColor=\'rgba(59,130,246,.5)\'" onblur="this.style.borderColor=\'var(--border)\'"></textarea>'
-      +'<div style="display:flex;justify-content:space-between;align-items:center;margin-top:9px"><span id="wHint" style="font-size:11px;color:var(--muted)">0/300</span><div style="display:flex;gap:7px"><button onclick="renderWidget(\'pick\')" style="padding:8px 14px;border-radius:9px;border:1px solid var(--border);background:transparent;color:var(--muted2);font-size:12px;cursor:pointer">← Back</button><button onclick="submitWidget()" style="padding:8px 20px;border-radius:9px;border:none;background:var(--accent);color:#fff;font-family:\'Unbounded\',sans-serif;font-size:10px;font-weight:700;cursor:pointer">Post →</button></div></div>';
+      +'<textarea id="wTa" placeholder="Your argument… (max 300)" maxlength="300" style="width:100%;min-height:78px;padding:11px 13px;border-radius:11px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-family:Manrope,sans-serif;font-size:13px;resize:none;outline:none;transition:border-color .16s"></textarea>'
+      +'<div style="display:flex;justify-content:space-between;align-items:center;margin-top:9px"><span id="wHint" style="font-size:11px;color:var(--muted)">0/300</span><div style="display:flex;gap:7px"><button onclick="renderWidget(&quot;pick&quot;)" style="padding:8px 14px;border-radius:9px;border:1px solid var(--border);background:transparent;color:var(--muted2);font-size:12px;cursor:pointer">← Back</button><button onclick="submitWidget()" style="padding:8px 20px;border-radius:9px;border:none;background:var(--accent);color:#fff;font-family:Unbounded,sans-serif;font-size:10px;font-weight:700;cursor:pointer">Post →</button></div></div>';
     setTimeout(function(){var t=document.getElementById('wTa');if(t){t.focus();t.addEventListener('input',function(){var h=document.getElementById('wHint');if(h)h.textContent=t.value.length+'/300';});}},50);
   }else if(step==='login'){
     var sc2=qSide==='YES'?'var(--yes)':'var(--no)';
-    w.innerHTML='<div style="margin-bottom:14px"><div style="font-family:\'Unbounded\',sans-serif;font-size:13px;font-weight:700;margin-bottom:5px">You picked <span style="color:'+sc2+'">'+qSide+'</span></div><div style="font-size:12px;color:var(--muted2)">Create a free account to post</div></div>'
+    w.innerHTML='<div style="margin-bottom:14px"><div style="font-family:Unbounded,sans-serif;font-size:13px;font-weight:700;margin-bottom:5px">You picked <span style="color:'+sc2+'">'+qSide+'</span></div><div style="font-size:12px;color:var(--muted2)">Create a free account to post</div></div>'
       +'<a href="/auth/google" style="display:flex;align-items:center;justify-content:center;gap:7px;padding:11px;border-radius:11px;border:1px solid var(--border2);background:var(--bg3);color:var(--text);font-size:13px;font-weight:600;text-decoration:none;margin-bottom:10px">'+gIcon()+'Continue with Google</a>'
       +'<div style="display:flex;align-items:center;gap:7px;margin-bottom:9px"><div style="flex:1;height:1px;background:var(--border)"></div><span style="font-size:11px;color:var(--muted)">or</span><div style="flex:1;height:1px;background:var(--border)"></div></div>'
-      +'<div style="display:flex;gap:7px"><input id="wUser" placeholder="choose a username…" maxlength="20" style="flex:1;padding:10px 12px;border-radius:9px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-size:13px;outline:none"/><button onclick="widgetLogin()" style="padding:10px 18px;border-radius:9px;border:none;background:var(--accent);color:#fff;font-family:\'Unbounded\',sans-serif;font-size:10px;font-weight:700;cursor:pointer">Join →</button></div>';
+      +'<div style="display:flex;gap:7px"><input id="wUser" placeholder="choose a username…" maxlength="20" style="flex:1;padding:10px 12px;border-radius:9px;border:1px solid var(--border);background:var(--bg3);color:var(--text);font-size:13px;outline:none"/><button onclick="widgetLogin()" style="padding:10px 18px;border-radius:9px;border:none;background:var(--accent);color:#fff;font-family:Unbounded,sans-serif;font-size:10px;font-weight:700;cursor:pointer">Join →</button></div>';
   }else if(step==='done'){
-    w.innerHTML='<div style="text-align:center;padding:14px 0"><div style="font-size:34px;margin-bottom:12px">🔥</div><div style="font-family:\'Unbounded\',sans-serif;font-size:15px;font-weight:700;margin-bottom:7px">Argument posted!</div><div style="font-size:13px;color:var(--text2);margin-bottom:20px">Others are already reading it.</div><a href="/debate/'+d.id+'" class="btn btn-blue">See the debate →</a></div>';
+    w.innerHTML='<div style="text-align:center;padding:14px 0"><div style="font-size:34px;margin-bottom:12px">🔥</div><div style="font-family:Unbounded,sans-serif;font-size:15px;font-weight:700;margin-bottom:7px">Argument posted!</div><div style="font-size:13px;color:var(--text2);margin-bottom:20px">Others are already reading it.</div><a href="/debate/'+d.id+'" class="btn btn-blue">See the debate →</a></div>';
   }
 }
 
@@ -1093,18 +1158,31 @@ ${SHARED_JS}
 
 <div class="ticker">
   <div class="ticker-track" id="tickerT">
-    ${["Is college a scam?","Should billionaires exist?","Will AI replace programmers?","Is democracy failing?","Is hustle culture toxic?","Should AI have legal rights?","Is capitalism broken?","Is remote work better?","Should social media be banned for kids?","Is freedom of speech absolute?"].flatMap(q=>[q,q]).map(q=>`<span class="ticker-item"><span class="tdot"></span>${esc(q)}</span>`).join('')}
+    ${(() => {
+      const tqs = ["Is college a scam?","Should billionaires exist?","Will AI replace programmers?","Is democracy failing?","Is hustle culture toxic?","Should AI have legal rights?","Is capitalism broken?","Is remote work better?","Should social media be banned for kids?","Is freedom of speech absolute?"];
+      return tqs.concat(tqs).map(q => `<span class="ticker-item"><span class="tdot"></span>${esc(q)}</span>`).join("");
+    })()}
   </div>
 </div>
 
 <script>
 var allDebates=[], curCat='All', curSort='hot', srTimer=null;
 
+function escRegExp(s){
+  var out='', specials='[](){}.*+?^$|', src=String(s);
+  for(var i=0;i<src.length;i++){
+    var ch=src[i];
+    if(specials.indexOf(ch)!==-1 || ch.charCodeAt(0)===92) out+='\\\\';
+    out+=ch;
+  }
+  return out;
+}
+
 function dCard(d, sq){
   var total=d.yes_count+d.no_count, yp=total>0?Math.round(d.yes_count/total*100):50;
   var t=d.type||'question', cls=t==='event'?'ev':'qu';
   var q=esc(d.question);
-  if(sq){var esc2=sq.replace(/[-[\]{}()*+?.,\\^$|#]/g,'\\$&');var re=new RegExp('('+esc2+')','gi');q=q.replace(re,'<mark class="highlight">$1</mark>');}
+  if(sq){var re=new RegExp('('+escRegExp(sq)+')','gi');q=q.replace(re,'<mark class="highlight">$1</mark>');}
   return '<a class="dcard" href="/debate/'+d.id+'">'
     +'<div class="dcard-top"><span class="ctag '+cls+'">'+esc(d.category)+'</span><span class="arg-ct">'+d.arg_count+' args</span></div>'
     +'<div class="dcard-q">'+q+'</div>'
@@ -1142,7 +1220,7 @@ function buildFilters(){
 async function loadDebates(){
   var data=await api('/api/debates?sort='+curSort);
   var wb=document.getElementById('warmup-banner');if(wb)wb.style.display='none';
-  if(!data){
+  if(!Array.isArray(data)){
     document.getElementById('evCol').innerHTML='<div class="empty-col">Could not connect — <a href="#" onclick="loadDebates();return false;" style="color:var(--accent)">retry</a></div>';
     document.getElementById('quCol').innerHTML='<div class="empty-col">Could not connect — <a href="#" onclick="loadDebates();return false;" style="color:var(--accent)">retry</a></div>';
     return;
@@ -1494,7 +1572,7 @@ async function toggleReplies(msgId){
     box.appendChild(d);
   });
   var rc=document.createElement('div'); rc.className='reply-comp';
-  rc.innerHTML='<input class="reply-in" id="ri-'+msgId+'" placeholder="Reply…" maxlength="300"/><button onclick="postReply('+msgId+')" style="padding:8px 14px;border-radius:8px;border:none;background:var(--accent);color:#fff;font-size:10px;font-weight:700;cursor:pointer;font-family:\'Unbounded\',sans-serif">Reply</button>';
+  rc.innerHTML='<input class="reply-in" id="ri-'+msgId+'" placeholder="Reply…" maxlength="300"/><button onclick="postReply('+msgId+')" style="padding:8px 14px;border-radius:8px;border:none;background:var(--accent);color:#fff;font-size:10px;font-weight:700;cursor:pointer;font-family:Unbounded,sans-serif">Reply</button>';
   box.appendChild(rc);
 }
 
@@ -1604,6 +1682,7 @@ body{padding-bottom:10px;}
 .back:hover{color:var(--text);}
 .prof-top{display:flex;align-items:center;gap:20px;margin-bottom:28px;padding:22px;background:var(--card);border:1px solid var(--border);border-radius:20px;}
 .avatar{width:64px;height:64px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:26px;flex-shrink:0;border:2px solid var(--border2);}
+.avatar img{width:100%;height:100%;object-fit:cover;border-radius:50%;display:block;}
 .prof-name{font-family:'Unbounded',sans-serif;font-size:20px;font-weight:900;display:flex;align-items:center;gap:9px;margin-bottom:4px;}
 .bio-text{font-size:13px;color:var(--text2);line-height:1.55;margin-top:4px;}
 .stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:9px;margin-bottom:26px;}
@@ -1634,6 +1713,11 @@ body{padding-bottom:10px;}
 .avatar-opt{width:36px;height:36px;border-radius:9px;border:2px solid var(--border);background:var(--bg3);font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .13s;}
 .avatar-opt:hover{border-color:var(--border2);}
 .avatar-opt.sel{border-color:var(--accent);background:var(--yes-dim);}
+.upload-row{display:flex;gap:10px;align-items:center;}
+.av-preview{width:56px;height:56px;border-radius:50%;border:2px solid var(--border2);display:flex;align-items:center;justify-content:center;font-size:24px;background:var(--bg3);flex-shrink:0;overflow:hidden;}
+.av-preview img{width:100%;height:100%;object-fit:cover;display:block;}
+.file-in{width:100%;padding:7px 9px;border-radius:9px;border:1px solid var(--border);background:var(--bg3);color:var(--muted2);font-size:12px;}
+.mhint{font-size:10px;color:var(--muted);margin-top:6px;}
 </style>
 </head>
 <body>
@@ -1664,10 +1748,27 @@ ${SHARED_JS}
   <div class="modal">
     <h3>✏️ Edit Profile</h3>
     <div class="mfield"><label>Display Name (optional)</label><input id="eDN" placeholder="Your display name…" maxlength="40"/></div>
+    <div class="mfield"><label>Headline</label><input id="eHeadline" placeholder="One line about you…" maxlength="80"/></div>
     <div class="mfield"><label>Bio (optional)</label><textarea id="eBio" placeholder="A short bio about you…" maxlength="200"></textarea></div>
+    <div class="mfield"><label>Interests</label><input id="eInterests" placeholder="AI, startups, books, football…" maxlength="180"/></div>
+    <div class="mfield"><label>Date of Birth</label><input id="eBirth" type="date"/></div>
+    <div class="mfield"><label>Location</label><input id="eLoc" placeholder="City, Country" maxlength="60"/></div>
     <div class="mfield">
       <label>Avatar</label>
       <div class="avatar-grid" id="avGrid"></div>
+    </div>
+    <div class="mfield">
+      <label>Profile Photo (optional)</label>
+      <div class="upload-row">
+        <div class="av-preview" id="avPreview">⚔️</div>
+        <div style="flex:1">
+          <input id="ePhoto" class="file-in" type="file" accept="image/png,image/jpeg,image/webp,image/gif"/>
+          <div style="display:flex;justify-content:flex-end;margin-top:6px">
+            <button class="edit-btn" id="ePhotoClear" type="button" style="margin-left:0">Remove photo</button>
+          </div>
+        </div>
+      </div>
+      <div class="mhint">PNG/JPG/WEBP/GIF, up to 350KB. Emoji stays as fallback.</div>
     </div>
     <div style="display:flex;gap:8px;margin-top:16px;justify-content:flex-end">
       <button class="edit-btn" id="editCancel">Cancel</button>
@@ -1680,34 +1781,111 @@ ${SHARED_JS}
 var TARGET='${EU}';
 var AVATARS=['⚔️','🔥','🧠','🎯','👑','🌍','⚡','🦁','🐺','🦊','🤖','💎','🥊','🎭','🌊','🦋'];
 var selAvatar=null;
+var selAvatarUrl=null;
 var editMod=document.getElementById('editMod');
 
 document.getElementById('editCancel').addEventListener('click',function(){editMod.classList.add('hidden');});
 editMod.addEventListener('click',function(e){if(e.target===editMod)editMod.classList.add('hidden');});
+document.getElementById('ePhotoClear').addEventListener('click',function(){
+  selAvatarUrl=null;
+  var fi=document.getElementById('ePhoto');
+  if(fi)fi.value='';
+  renderAvatarPreview();
+});
+document.getElementById('ePhoto').addEventListener('change',async function(e){
+  var file=e.target&&e.target.files&&e.target.files[0];
+  if(!file) return;
+  if(['image/png','image/jpeg','image/webp','image/gif'].indexOf(file.type)===-1){
+    toast('Only PNG/JPG/WEBP/GIF allowed','error');
+    e.target.value='';
+    return;
+  }
+  if(file.size>350*1024){
+    toast('Photo is too large (max 350KB)','error');
+    e.target.value='';
+    return;
+  }
+  try{
+    selAvatarUrl=await fileToDataUrl(file);
+    renderAvatarPreview();
+  }catch(_e){
+    toast('Could not read this file','error');
+    e.target.value='';
+  }
+});
+
+function fileToDataUrl(file){
+  return new Promise(function(resolve,reject){
+    var fr=new FileReader();
+    fr.onload=function(){resolve(String(fr.result||''));};
+    fr.onerror=function(){reject(new Error('read_failed'));};
+    fr.readAsDataURL(file);
+  });
+}
+
+function renderAvatarGrid(){
+  var grid=document.getElementById('avGrid');
+  grid.innerHTML=AVATARS.map(function(a){return '<button class="avatar-opt'+(a===selAvatar?' sel':'')+'" data-av="'+a+'">'+a+'</button>';}).join('');
+  grid.querySelectorAll('.avatar-opt').forEach(function(btn){
+    btn.addEventListener('click',function(){
+      selAvatar=btn.getAttribute('data-av');
+      selAvatarUrl=null;
+      var fi=document.getElementById('ePhoto');
+      if(fi)fi.value='';
+      grid.querySelectorAll('.avatar-opt').forEach(function(b){b.classList.toggle('sel',b.getAttribute('data-av')===selAvatar);});
+      renderAvatarPreview();
+    });
+  });
+}
+
+function renderAvatarPreview(){
+  var prev=document.getElementById('avPreview');
+  if(!prev) return;
+  if(selAvatarUrl){
+    prev.innerHTML='<img src="'+esc(selAvatarUrl)+'" alt="avatar preview"/>';
+  }else{
+    prev.textContent=selAvatar||'⚔️';
+  }
+}
 
 document.getElementById('editSave').addEventListener('click',async function(){
   var dn=document.getElementById('eDN').value.trim();
+  var hd=document.getElementById('eHeadline').value.trim();
   var bio=document.getElementById('eBio').value.trim();
-  var r=await api('/api/profile',{method:'PATCH',body:JSON.stringify({display_name:dn,bio:bio,avatar:selAvatar})});
+  var interests=document.getElementById('eInterests').value.trim();
+  var birth=document.getElementById('eBirth').value||'';
+  var loc=document.getElementById('eLoc').value.trim();
+  var r=await api('/api/profile',{method:'PATCH',body:JSON.stringify({display_name:dn,headline:hd,bio:bio,interests:interests,birth_date:birth,location:loc,avatar:selAvatar,avatar_url:selAvatarUrl})});
   if(!r||r.error){toast((r&&r.error)||'Error','error');return;}
-  toast('Profile updated!','success');
+  toast('Profile updated. Your brand is sharper now.','success');
   editMod.classList.add('hidden');
   load();
 });
 
 function openEdit(user){
   document.getElementById('eDN').value=user.display_name||'';
+  document.getElementById('eHeadline').value=user.headline||'';
   document.getElementById('eBio').value=user.bio||'';
+  document.getElementById('eInterests').value=user.interests||'';
+  document.getElementById('eBirth').value=user.birth_date||'';
+  document.getElementById('eLoc').value=user.location||'';
   selAvatar=user.avatar||'⚔️';
-  var grid=document.getElementById('avGrid');
-  grid.innerHTML=AVATARS.map(function(a){return '<button class="avatar-opt'+(a===selAvatar?' sel':'')+'" data-av="'+a+'">'+a+'</button>';}).join('');
-  grid.querySelectorAll('.avatar-opt').forEach(function(btn){
-    btn.addEventListener('click',function(){
-      selAvatar=btn.getAttribute('data-av');
-      grid.querySelectorAll('.avatar-opt').forEach(function(b){b.classList.toggle('sel',b.getAttribute('data-av')===selAvatar);});
-    });
-  });
+  selAvatarUrl=user.avatar_url||null;
+  var fi=document.getElementById('ePhoto');
+  if(fi)fi.value='';
+  renderAvatarGrid();
+  renderAvatarPreview();
   editMod.classList.remove('hidden');
+}
+
+function openEditFromBtn(btn){
+  var payload=btn&&btn.getAttribute('data-u');
+  if(!payload) return;
+  try{
+    openEdit(JSON.parse(decodeURIComponent(payload)));
+  }catch(_e){
+    toast('Could not open editor','error');
+  }
 }
 
 async function load(){
@@ -1718,25 +1896,43 @@ async function load(){
   if(me){var b=badge(me.rating);nr.innerHTML='<a href="/u/'+esc(me.username)+'" class="nav-link" style="font-weight:600">'+esc(me.username)+(b?'<span style="margin-left:3px">'+b+'</span>':'')+'</a><span style="color:var(--gold);font-size:11px">★'+me.rating+'</span><button class="theme-btn" id="themeBtn" onclick="toggleTheme()">☀️</button>';}
   if(!pd||pd.error){document.getElementById('content').innerHTML='<div style="text-align:center;padding:56px;color:var(--muted)">User not found</div>';return;}
   var u=pd.user, st=pd.stats, msgs=pd.top_messages, rank=pd.rank;
-  var initial=u.username[0].toUpperCase();
   var hue=(u.username.split('').reduce(function(a,c){return a+c.charCodeAt(0);},0)*47)%360;
   var av=u.avatar||'⚔️';
+  var avHtml=u.avatar_url?'<img src="'+esc(u.avatar_url)+'" alt="avatar"/>':esc(av);
   var dn=u.display_name||u.username;
+  var bd=u.birth_date?new Date(u.birth_date).toLocaleDateString('en-US',{day:'numeric',month:'short',year:'numeric'}):'';
+  var ints=(u.interests||'').split(',').map(function(x){return x.trim();}).filter(Boolean).slice(0,8);
   var b=badge(u.rating);
   var joined=new Date(u.created_at).toLocaleDateString('en-US',{month:'long',year:'numeric'});
+  var editPayload=encodeURIComponent(JSON.stringify({
+    display_name:u.display_name||'',
+    headline:u.headline||'',
+    bio:u.bio||'',
+    interests:u.interests||'',
+    birth_date:(u.birth_date?String(u.birth_date).slice(0,10):''),
+    location:u.location||'',
+    avatar:av,
+    avatar_url:u.avatar_url||null
+  }));
   document.getElementById('content').innerHTML=
     '<div class="prof-top">'
-      +'<div class="avatar" style="background:linear-gradient(135deg,hsl('+hue+',48%,18%),hsl('+hue+',38%,26%));border-color:hsl('+hue+',44%,32%)">'+av+'</div>'
+      +'<div class="avatar" style="background:linear-gradient(135deg,hsl('+hue+',48%,18%),hsl('+hue+',38%,26%));border-color:hsl('+hue+',44%,32%)">'+avHtml+'</div>'
       +'<div style="flex:1;min-width:0">'
         +'<div class="prof-name">'+esc(dn)+(b?'<span>'+b+'</span>':'')
-          +(isOwn?'<button class="edit-btn" onclick="openEdit('+JSON.stringify({display_name:u.display_name||'',bio:u.bio||'',avatar:av}).replace(/</g,'\\u003c')+')">✏️ Edit</button>':'')+'</div>'
+          +(isOwn?'<button class="edit-btn" data-u="'+editPayload+'" onclick="openEditFromBtn(this)">✏️ Edit</button>':'')+'</div>'
         +(u.display_name&&u.display_name!==u.username?'<div style="font-size:11px;color:var(--muted2);margin-bottom:3px">@'+esc(u.username)+'</div>':'')
         +'<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
-          +'<div style="font-family:\'Unbounded\',sans-serif;font-size:14px;font-weight:700;color:var(--gold);background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.2);padding:4px 12px;border-radius:8px">★ '+u.rating+' pts</div>'
+          +'<div style="font-family:Unbounded,sans-serif;font-size:14px;font-weight:700;color:var(--gold);background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.2);padding:4px 12px;border-radius:8px">★ '+u.rating+' pts</div>'
           +'<div style="font-size:11px;color:var(--muted2)">Rank #'+rank+'</div>'
           +'<div style="font-size:11px;color:var(--muted)">Joined '+joined+'</div>'
         +'</div>'
+        +(u.headline?'<div style="font-size:12px;color:var(--text2);margin-top:6px">'+esc(u.headline)+'</div>':'')
         +(u.bio?'<div class="bio-text">'+esc(u.bio)+'</div>':'')
+        +((u.location||bd||ints.length)?'<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px">'
+          +(u.location?'<span style="font-size:10px;padding:4px 8px;border-radius:999px;border:1px solid var(--border2);background:var(--bg3);color:var(--text2)">📍 '+esc(u.location)+'</span>':'')
+          +(bd?'<span style="font-size:10px;padding:4px 8px;border-radius:999px;border:1px solid var(--border2);background:var(--bg3);color:var(--text2)">🎂 '+esc(bd)+'</span>':'')
+          +(ints.length?ints.map(function(i){return '<span style="font-size:10px;padding:4px 8px;border-radius:999px;border:1px solid rgba(59,130,246,.28);background:var(--yes-dim);color:var(--accent)">'+esc(i)+'</span>';}).join(''):'')
+          +'</div>':'')
       +'</div></div>'
     +'<div class="stats-grid">'
       +'<div class="stat-card"><div class="stat-n">'+st.total_args+'</div><div class="stat-l">Arguments</div></div>'
@@ -1897,6 +2093,7 @@ ${SHARED_JS}
 
 <script>
 var me=null, curSide='YES', liveState=null, countdownInt=null, curRemaining=0, feedMsgs=[], debateId=null, posted=false;
+var liveDrafts={}, lastRenderKey='';
 var CIRC=238.76;
 
 async function lovLogin(){
@@ -1924,37 +2121,79 @@ function updateTimer(remaining, duration){
   if(tn)tn.textContent=remaining;
 }
 
-function renderPhaseContent(state){
+function getLiveDraft(id){
+  var key=String(id||'');
+  if(!liveDrafts[key]) liveDrafts[key]={side:'YES',text:''};
+  return liveDrafts[key];
+}
+
+function updateArgueScoreBar(){
+  var yes=feedMsgs.filter(function(m){return m.side==="YES";}).length;
+  var no=feedMsgs.filter(function(m){return m.side==="NO";}).length;
+  var y=document.getElementById('liveYesCt');
+  var n=document.getElementById('liveNoCt');
+  if(y)y.textContent='YES '+yes;
+  if(n)n.textContent=no+' NO';
+}
+
+function renderPhaseContent(state, force){
   if(!state||!state.debate) return;
   var d=state.debate, ph=state.phase;
   var qa=document.getElementById('qArea');
-  setPhase(ph);
-  document.getElementById('phaseLabel').textContent=ph.toUpperCase();
-  var timerWrap='<div class="timer-wrap"><svg class="timer-svg" width="88" height="88" viewBox="0 0 88 88"><circle class="timer-bg" cx="44" cy="44" r="38"/><circle class="timer-arc" cx="44" cy="44" r="38" id="timerArc" stroke-dasharray="238.76" stroke-dashoffset="0"/></svg><div class="timer-num" id="timerNum">'+state.remaining+'</div></div><div class="timer-phase" id="phaseLabel">'+ph.toUpperCase()+'</div>';
-  var header='<div class="live-cat">'+esc(d.category)+' · '+(d.type==='event'?'🌍 Event':'💭 Question')+'</div><h2 class="live-q">'+esc(d.question)+'</h2>';
-  if(ph==='read'){
-    qa.innerHTML=header+timerWrap+'<p class="read-content">Take a moment to form your opinion. Arguing starts soon.</p>';
-  }else if(ph==='argue'){
-    qa.innerHTML=header+timerWrap
-      +'<div class="argue-content">'
-      +'<div class="score-bar"><span style="color:var(--yes)">YES '+(feedMsgs.filter(function(m){return m.side==="YES";}).length)+'</span><span style="flex:1;text-align:center;color:var(--muted)">·</span><span style="color:var(--no)">'+(feedMsgs.filter(function(m){return m.side==="NO";}).length)+' NO</span></div>'
-      +(posted?'<div style="text-align:center;padding:14px;background:var(--bg3);border-radius:11px;font-size:13px;color:var(--text2)">✓ Argument posted! Watch the votes roll in.</div>'
-      :'<div class="side-btns"><button class="live-side y on" id="liveBtnY" onclick="setLS(\'YES\')">✓ YES</button><button class="live-side n" id="liveBtnN" onclick="setLS(\'NO\')">✗ NO</button></div>'
-      +'<textarea class="live-ta" id="liveTa" placeholder="One sharp argument… (max 300 chars)" maxlength="300"></textarea>'
-      +'<button class="live-post" id="livePost" onclick="postLive()">Post argument →</button>')
-      +'</div>';
-  }else if(ph==='vote'){
-    var cards=feedMsgs.slice(0,12).map(function(m){
-      var sc=m.score>0?'pos':m.score<0?'neg':'zero', pc=m.side==='YES'?'yes':'no';
-      return '<div class="vote-card"><div class="vcol"><div class="vscore '+sc+'" id="lsc-'+m.id+'">'+m.score+'</div><button class="vbtn up" onclick="liveVote('+m.id+',1)">▲</button><button class="vbtn down" onclick="liveVote('+m.id+',-1)">▼</button></div><div><div style="display:flex;align-items:center;gap:5px;margin-bottom:4px"><span class="pill '+pc+'">'+m.side+'</span><a href="/u/'+esc(m.username)+'" style="font-size:10px;font-weight:700">'+esc(m.username)+'</a></div><div class="vote-body">'+esc(m.text)+'</div></div></div>';
-    }).join('');
-    qa.innerHTML=header+'<p style="font-size:12px;color:var(--muted2);margin-bottom:11px">Vote for the best arguments</p><div class="vote-list">'+cards+'</div>';
+  var renderKey=String(d.id)+'|'+ph+'|'+(posted?'1':'0');
+  var shouldRebuild=!!force||renderKey!==lastRenderKey;
+  if(ph==='argue'&&!posted){
+    var draft=getLiveDraft(d.id);
+    curSide=draft.side==='NO'?'NO':'YES';
   }
+
+  setPhase(ph);
+  if(shouldRebuild){
+    var timerWrap='<div class="timer-wrap"><svg class="timer-svg" width="88" height="88" viewBox="0 0 88 88"><circle class="timer-bg" cx="44" cy="44" r="38"/><circle class="timer-arc" cx="44" cy="44" r="38" id="timerArc" stroke-dasharray="238.76" stroke-dashoffset="0"/></svg><div class="timer-num" id="timerNum">'+state.remaining+'</div></div><div class="timer-phase" id="phaseLabel">'+ph.toUpperCase()+'</div>';
+    var header='<div class="live-cat">'+esc(d.category)+' · '+(d.type==='event'?'🌍 Event':'💭 Question')+'</div><h2 class="live-q">'+esc(d.question)+'</h2>';
+    if(ph==='read'){
+      qa.innerHTML=header+timerWrap+'<p class="read-content">Take a moment to form your opinion. Arguing starts soon.</p>';
+    }else if(ph==='argue'){
+      qa.innerHTML=header+timerWrap
+        +'<div class="argue-content">'
+        +'<div class="score-bar"><span id="liveYesCt" style="color:var(--yes)">YES 0</span><span style="flex:1;text-align:center;color:var(--muted)">·</span><span id="liveNoCt" style="color:var(--no)">0 NO</span></div>'
+        +(posted?'<div style="text-align:center;padding:14px;background:var(--bg3);border-radius:11px;font-size:13px;color:var(--text2)">✓ Argument posted! Watch the votes roll in.</div>'
+        :'<div class="side-btns"><button class="live-side y'+(curSide==='YES'?' on':'')+'" id="liveBtnY" onclick="setLS(&quot;YES&quot;)">✓ YES</button><button class="live-side n'+(curSide==='NO'?' on':'')+'" id="liveBtnN" onclick="setLS(&quot;NO&quot;)">✗ NO</button></div>'
+        +'<textarea class="live-ta" id="liveTa" placeholder="One sharp argument… (max 300 chars)" maxlength="300"></textarea>'
+        +'<button class="live-post" id="livePost" onclick="postLive()">Post argument →</button>')
+        +'</div>';
+      if(!posted){
+        var ta=document.getElementById('liveTa');
+        var draftState=getLiveDraft(d.id);
+        if(ta){
+          ta.value=draftState.text||'';
+          ta.addEventListener('input',function(){
+            getLiveDraft(d.id).text=ta.value;
+          });
+        }
+        setLS(draftState.side==='NO'?'NO':'YES');
+      }
+      updateArgueScoreBar();
+    }else if(ph==='vote'){
+      var cards=feedMsgs.slice(0,12).map(function(m){
+        var sc=m.score>0?'pos':m.score<0?'neg':'zero', pc=m.side==='YES'?'yes':'no';
+        return '<div class="vote-card"><div class="vcol"><div class="vscore '+sc+'" id="lsc-'+m.id+'">'+m.score+'</div><button class="vbtn up" onclick="liveVote('+m.id+',1)">▲</button><button class="vbtn down" onclick="liveVote('+m.id+',-1)">▼</button></div><div><div style="display:flex;align-items:center;gap:5px;margin-bottom:4px"><span class="pill '+pc+'">'+m.side+'</span><a href="/u/'+esc(m.username)+'" style="font-size:10px;font-weight:700">'+esc(m.username)+'</a></div><div class="vote-body">'+esc(m.text)+'</div></div></div>';
+      }).join('');
+      qa.innerHTML=header+'<p style="font-size:12px;color:var(--muted2);margin-bottom:11px">Vote for the best arguments</p><div class="vote-list">'+cards+'</div>';
+    }
+    lastRenderKey=renderKey;
+  }else if(ph==='argue'){
+    updateArgueScoreBar();
+  }
+
+  var phaseLabel=document.getElementById('phaseLabel');
+  if(phaseLabel)phaseLabel.textContent=ph.toUpperCase();
   updateTimer(state.remaining, state.duration);
 }
 
 function setLS(s){
   curSide=s;
+  if(debateId)getLiveDraft(debateId).side=s;
   var by=document.getElementById('liveBtnY'), bn=document.getElementById('liveBtnN');
   if(by)by.className='live-side y'+(s==='YES'?' on':'');
   if(bn)bn.className='live-side n'+(s==='NO'?' on':'');
@@ -1974,8 +2213,15 @@ async function postLive(){
   var pb=document.getElementById('livePost'); if(pb){pb.disabled=true;pb.textContent='Posting…';}
   var r=await api('/debate/'+debateId+'/messages',{method:'POST',body:JSON.stringify({text:text,side:curSide})});
   if(!r||r.error){toast((r&&r.error)||'Error','error');if(pb){pb.disabled=false;pb.textContent='Post argument →';}return;}
-  posted=true; toast('Posted! 🔥','success');
-  if(liveState)renderPhaseContent(liveState);
+  posted=true;
+  if(debateId){
+    var draft=getLiveDraft(debateId);
+    draft.text='';
+    draft.side=curSide;
+  }
+  toast('Posted. Own the narrative.','success');
+  lastRenderKey='';
+  if(liveState)renderPhaseContent(liveState,true);
 }
 
 function addFeedMsg(m){
@@ -1986,6 +2232,7 @@ function addFeedMsg(m){
   card.innerHTML='<div class="feed-top"><span class="pill '+pc+'" style="font-size:9px">'+m.side+'</span><a href="/u/'+esc(m.username)+'" style="font-size:10px;font-weight:700">'+esc(m.username)+'</a><span style="font-size:9px;color:var(--muted);margin-left:auto">now</span></div><div class="feed-body">'+esc(m.text)+'</div>';
   feed.insertBefore(card, feed.firstChild);
   var ct=document.getElementById('argCtR'); if(ct){var n=parseInt(ct.textContent)||0;ct.textContent=(n+1)+' args';}
+  updateArgueScoreBar();
 }
 
 var pollInt=null;
@@ -2003,13 +2250,16 @@ async function pollLive(){
     if(debateId!==state.debate.id){
       debateId=state.debate.id; feedMsgs=[];
       posted=false;
+      lastRenderKey='';
+      curSide=getLiveDraft(debateId).side;
       // load existing args
-      var msgs=await api('/debate/'+state.debate.id+'/messages?sort=top&limit=20')||[];
+      var msgs=await api('/debate/'+state.debate.id+'/messages?sort=top&limit=20');
+      if(!Array.isArray(msgs)) msgs=[];
       feedMsgs=msgs;
       document.getElementById('rpFeed').innerHTML='';
       msgs.slice(0,8).forEach(function(m){addFeedMsg(m);});
     }
-    renderPhaseContent(state);
+    renderPhaseContent(state,false);
     if(state.next&&state.next.question) document.getElementById('nextQ').textContent=state.next.question;
   }
   curRemaining=state.remaining||0;
@@ -2273,8 +2523,8 @@ function renderDebatesTable(){
     t+='<tr>'
       +'<td style="color:var(--muted);font-size:10px">'+d.id+'</td>'
       +'<td style="max-width:280px"><div style="font-weight:600;font-size:12px;line-height:1.3">'+esc(d.question)+'</div></td>'
-      +'<td><input class="inline-edit" style="width:110px" value="'+esc(d.category)+'" onchange="updateDebate('+d.id+',\'category\',this.value)"/></td>'
-      +'<td><select class="inline-edit" style="width:92px" onchange="updateDebate('+d.id+',\'type\',this.value)">'
+      +'<td><input class="inline-edit" style="width:110px" value="'+esc(d.category)+'" onchange="updateDebate('+d.id+',&quot;category&quot;,this.value)"/></td>'
+      +'<td><select class="inline-edit" style="width:92px" onchange="updateDebate('+d.id+',&quot;type&quot;,this.value)">'
         +'<option value="question"'+(d.type==='question'?' selected':'')+'>💭 Q</option>'
         +'<option value="event"'+(d.type==='event'?' selected':'')+'>🌍 Ev</option>'
       +'</select></td>'
@@ -2336,13 +2586,14 @@ async function loadUsersPanel(){
     allUsers=data.all_users||[];
     renderCatsPanel(data.categories||[]);
     renderUsersTable();
+  }catch(e){}
 }
 
 function renderCatsPanel(cats){
   if(!cats.length){document.getElementById('catsView').innerHTML='<div style="color:var(--muted);font-size:13px">No categories found</div>';return;}
   document.getElementById('catsView').innerHTML=cats.map(function(c){
     return '<div class="cat-item"><strong style="flex:1">'+esc(c.category)+'</strong><span style="font-size:12px;color:var(--muted2)">'+c.count+' debates</span>'
-      +'<button class="act-btn del" onclick="deleteCategory(\''+esc(c.category)+'\')">Delete cat</button></div>';
+      +'<button class="act-btn del" data-cat="'+encodeURIComponent(c.category)+'" onclick="deleteCategory(decodeURIComponent(this.dataset.cat))">Delete cat</button></div>';
   }).join('');
 }
 
@@ -2361,10 +2612,10 @@ function renderUsersTable(){
     +allUsers.map(function(u){
       return '<tr>'
         +'<td><a href="/u/'+esc(u.username)+'" target="_blank" style="font-weight:700">'+esc(u.username)+'</a></td>'
-        +'<td><input class="inline-edit" type="number" style="width:70px" value="'+u.rating+'" onchange="setRating(\''+esc(u.username)+'\',this.value)"/></td>'
+        +'<td><input class="inline-edit" type="number" style="width:70px" value="'+u.rating+'" data-user="'+encodeURIComponent(u.username)+'" onchange="setRating(decodeURIComponent(this.dataset.user),this.value)"/></td>'
         +'<td>'+u.arg_count+'</td>'
         +'<td style="color:var(--muted2)">'+new Date(u.created_at).toLocaleDateString()+'</td>'
-        +'<td><button class="act-btn del" onclick="delUser(\''+esc(u.username)+'\')">Delete</button></td>'
+        +'<td><button class="act-btn del" data-user="'+encodeURIComponent(u.username)+'" onclick="delUser(decodeURIComponent(this.dataset.user))">Delete</button></td>'
       +'</tr>';
     }).join('')
     +'</tbody></table>';
