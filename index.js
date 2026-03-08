@@ -717,31 +717,22 @@ function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').repl
 function ago(ts){var s=Math.floor((Date.now()-new Date(ts))/1000);if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago';}
 function badge(r){if(r>=500)return'💎';if(r>=200)return'🥇';if(r>=100)return'🥈';if(r>=25)return'🥉';return'';}
 async function api(url,opts){
-  // Try up to 3 times with increasing timeouts for cold starts
-  var delays=[10000,25000,45000];
-  for(var attempt=0;attempt<delays.length;attempt++){
-    var ctrl=new AbortController();
-    var tid=setTimeout(function(){ctrl.abort();},delays[attempt]);
-    try{
-      var r=await fetch(url,Object.assign({credentials:'same-origin',headers:{'content-type':'application/json'},signal:ctrl.signal},opts||{}));
-      clearTimeout(tid);
-      // Hide warmup banner on success
-      var wb=document.getElementById('warmup-banner');
-      if(wb) wb.style.display='none';
-      var t=await r.text();
-      try{return JSON.parse(t);}catch(e){return{error:'Parse error'};}
-    }catch(e){
-      clearTimeout(tid);
-      if(e.name!=='AbortError') return null;
-      if(attempt<delays.length-1){
-        // Show warmup banner during retry
-        var wb2=document.getElementById('warmup-banner');
-        if(wb2) wb2.style.display='flex';
-        await new Promise(function(res){setTimeout(res,500);});
-      }
-    }
+  // Show warmup banner after 3s of waiting (cold start can take 30-60s on Render free tier)
+  var bannerTimer=setTimeout(function(){
+    var wb=document.getElementById('warmup-banner');
+    if(wb) wb.style.display='flex';
+  },3000);
+  try{
+    var r=await fetch(url,Object.assign({credentials:'same-origin',headers:{'content-type':'application/json'}},opts||{}));
+    clearTimeout(bannerTimer);
+    var wb=document.getElementById('warmup-banner');
+    if(wb) wb.style.display='none';
+    var t=await r.text();
+    try{return JSON.parse(t);}catch(e){return{error:'Parse error'};}
+  }catch(e){
+    clearTimeout(bannerTimer);
+    return null;
   }
-  return null;
 }
 function toggleTheme(){
   var isL=document.documentElement.getAttribute('data-theme')==='light';
@@ -2234,24 +2225,8 @@ async function doLogout(){
 }
 
 async function checkSession(){
-  // Quick 4s check - if already logged in, show dashboard
-  // Otherwise just show login form (no blocking)
-  var ctrl=new AbortController();
-  var tid=setTimeout(function(){ctrl.abort();},4000);
-  try{
-    var r=await fetch('/admin/api/stats',{credentials:'same-origin',headers:{'content-type':'application/json'},signal:ctrl.signal});
-    clearTimeout(tid);
-    if(!r.ok) return; // not logged in
-    var data=await r.json();
-    if(data&&!data.error){
-      document.getElementById('loginView').style.display='none';
-      document.getElementById('dashView').style.display='block';
-      document.getElementById('navRight').innerHTML='<span style="font-size:12px;color:var(--muted2)">Admin</span><button class="theme-btn" id="themeBtn" onclick="toggleTheme()">☀️</button>';
-      renderStats(data);
-      loadDebatesPanel();
-      loadUsersPanel();
-    }
-  }catch(e){clearTimeout(tid);}
+  // Just show login form - user will log in manually
+  // (avoids 30-60s cold start blocking admin panel)
 }
 
 async function loadAll(){
