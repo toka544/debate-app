@@ -80,7 +80,7 @@ function trackView(req, res, path) {
 // Admin auth middleware
 function requireAdmin(req, res, next) {
   if (req.cookies?.admin_session === ADMIN_PASSWORD) return next();
-  return res.status(401).type("html").send(adminLoginPage(""));
+  return res.status(401).json({ error: "Unauthorized" });
 }
 
 // ─────────────────────────────────────────────────────────
@@ -717,24 +717,27 @@ function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').repl
 function ago(ts){var s=Math.floor((Date.now()-new Date(ts))/1000);if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';if(s<86400)return Math.floor(s/3600)+'h ago';return Math.floor(s/86400)+'d ago';}
 function badge(r){if(r>=500)return'💎';if(r>=200)return'🥇';if(r>=100)return'🥈';if(r>=25)return'🥉';return'';}
 async function api(url,opts){
-  // Try up to 3 times with increasing timeouts
-  var delays=[8000,20000,40000];
+  // Try up to 3 times with increasing timeouts for cold starts
+  var delays=[10000,25000,45000];
   for(var attempt=0;attempt<delays.length;attempt++){
     var ctrl=new AbortController();
     var tid=setTimeout(function(){ctrl.abort();},delays[attempt]);
     try{
       var r=await fetch(url,Object.assign({credentials:'same-origin',headers:{'content-type':'application/json'},signal:ctrl.signal},opts||{}));
       clearTimeout(tid);
+      // Hide warmup banner on success
+      var wb=document.getElementById('warmup-banner');
+      if(wb) wb.style.display='none';
       var t=await r.text();
       try{return JSON.parse(t);}catch(e){return{error:'Parse error'};}
     }catch(e){
       clearTimeout(tid);
       if(e.name!=='AbortError') return null;
-      // timed out - show warming up and retry
-      var wb=document.getElementById('warmup-banner');
-      if(wb){wb.style.display='flex';}
       if(attempt<delays.length-1){
-        await new Promise(function(res){setTimeout(res,1000);});
+        // Show warmup banner during retry
+        var wb2=document.getElementById('warmup-banner');
+        if(wb2) wb2.style.display='flex';
+        await new Promise(function(res){setTimeout(res,500);});
       }
     }
   }
@@ -2108,7 +2111,7 @@ ${SHARED_JS}
 <div class="page" id="loginView">
   <div class="login-wrap">
     <h2>🛡️ Admin</h2>
-    <input id="pwIn" type="password" placeholder="Admin password" style="width:100%;padding:11px 13px;border-radius:11px;border:1px solid var(--border);background:var(--bg2);color:var(--text);font-size:14px;outline:none;margin-bottom:11px;"/>
+    <input id="pwIn" type="password" placeholder="Admin password" style="width:100%;padding:11px 13px;border-radius:11px;border:1px solid var(--border);background:var(--bg2);color:var(--text);font-size:14px;outline:none;margin-bottom:11px;" onkeydown="if(event.key==='Enter')doLogin()"/>
     <button onclick="doLogin()" class="btn btn-blue" style="width:100%;padding:12px;font-size:11px">Sign in →</button>
     <div id="loginErr" style="margin-top:10px;font-size:12px;color:var(--no)"></div>
   </div>
@@ -2189,21 +2192,38 @@ function hideErr(){var eb=document.getElementById('errBox');if(eb)eb.style.displ
 
 async function doLogin(){
   var pw=(document.getElementById('pwIn')||{}).value||'';
-  var btn=document.querySelector('#loginView .btn-blue');
+  if(!pw){document.getElementById('loginErr').textContent='Enter password';return;}
+  var btn=document.querySelector('#loginView button');
   var errEl=document.getElementById('loginErr');
-  if(btn){btn.disabled=true;btn.textContent='Connecting…';}
-  if(errEl){errEl.textContent='';}
-  var r=await api('/admin/login',{method:'POST',body:JSON.stringify({password:pw})});
-  if(btn){btn.disabled=false;btn.textContent='Sign in →';}
-  if(!r){
-    if(errEl)errEl.textContent='Server warming up, please try again';
-    return;
+  var secs=0,ti=null;
+  function setBtn(txt){if(btn)btn.textContent=txt;}
+  if(btn){btn.disabled=true;}
+  errEl.textContent='';
+  // Show live countdown so user knows it's working (Render cold start can be 50s)
+  setBtn('Connecting… 0s');
+  ti=setInterval(function(){secs++;setBtn('Connecting… '+secs+'s');},1000);
+  try{
+    var resp=await fetch('/admin/login',{
+      method:'POST',
+      credentials:'same-origin',
+      headers:{'content-type':'application/json'},
+      body:JSON.stringify({password:pw})
+    });
+    clearInterval(ti);
+    if(btn){btn.disabled=false;}
+    var data=await resp.json();
+    if(data.error){setBtn('Sign in →');errEl.textContent=data.error;return;}
+    setBtn('Sign in →');
+    document.getElementById('loginView').style.display='none';
+    document.getElementById('dashView').style.display='block';
+    document.getElementById('navRight').innerHTML='<span style="font-size:12px;color:var(--muted2)">Admin</span><button class="theme-btn" id="themeBtn" onclick="toggleTheme()">☀️</button>';
+    loadAll();
+  }catch(e){
+    clearInterval(ti);
+    if(btn){btn.disabled=false;}
+    setBtn('Sign in →');
+    errEl.textContent='Connection error: '+e.message+'. Try again.';
   }
-  if(r.error){if(errEl)errEl.textContent=r.error;return;}
-  document.getElementById('loginView').style.display='none';
-  document.getElementById('dashView').style.display='block';
-  document.getElementById('navRight').innerHTML='<span style="font-size:12px;color:var(--muted2)">Admin</span><button class="theme-btn" id="themeBtn" onclick="toggleTheme()">☀️</button>';
-  loadAll();
 }
 
 async function doLogout(){
@@ -2214,15 +2234,15 @@ async function doLogout(){
 }
 
 async function checkSession(){
-  // Don't block login screen with a cold-start check - just show login
-  // (doLogin will handle warm-up messaging)
-  // But still check silently with short timeout
+  // Quick 4s check - if already logged in, show dashboard
+  // Otherwise just show login form (no blocking)
   var ctrl=new AbortController();
-  var tid=setTimeout(function(){ctrl.abort();},5000);
+  var tid=setTimeout(function(){ctrl.abort();},4000);
   try{
     var r=await fetch('/admin/api/stats',{credentials:'same-origin',headers:{'content-type':'application/json'},signal:ctrl.signal});
     clearTimeout(tid);
-    var data=JSON.parse(await r.text());
+    if(!r.ok) return; // not logged in
+    var data=await r.json();
     if(data&&!data.error){
       document.getElementById('loginView').style.display='none';
       document.getElementById('dashView').style.display='block';
@@ -2231,19 +2251,18 @@ async function checkSession(){
       loadDebatesPanel();
       loadUsersPanel();
     }
-  }catch(e){clearTimeout(tid);/* not logged in or cold start, just show login form */}
+  }catch(e){clearTimeout(tid);}
 }
 
 async function loadAll(){
   hideErr();
-  var wb=document.getElementById('warmup-banner');if(wb)wb.style.display='flex';
   try{
-    var r=await api('/admin/api/stats');
-    if(wb)wb.style.display='none';
-    if(!r){showErr('Server not responding — the DB is warming up. Click Retry in ~20 seconds.');return;}
-    if(r.error){showErr('Error: '+r.error);return;}
-    renderStats(r);
-  }catch(e){if(wb)wb.style.display='none';showErr('JS Error: '+e.message);return;}
+    var r=await fetch('/admin/api/stats',{credentials:'same-origin',headers:{'content-type':'application/json'}});
+    if(!r.ok){showErr('Error '+r.status+' — try refreshing');return;}
+    var data=await r.json();
+    if(data.error){showErr('Error: '+data.error);return;}
+    renderStats(data);
+  }catch(e){showErr('Network error: '+e.message);return;}
   loadDebatesPanel();
   loadUsersPanel();
 }
@@ -2264,10 +2283,13 @@ function renderStats(d){
 }
 
 async function loadDebatesPanel(){
-  var data=await api('/admin/api/stats');
-  if(!data||data.error) return;
-  allDebates=data.debates_list||[];
-  renderDebatesTable();
+  try{
+    var r=await fetch('/admin/api/stats',{credentials:'same-origin',headers:{'content-type':'application/json'}});
+    var data=await r.json();
+    if(!data||data.error) return;
+    allDebates=data.debates_list||[];
+    renderDebatesTable();
+  }catch(e){}
 }
 
 function renderDebatesTable(){
@@ -2332,11 +2354,13 @@ async function delDebate(id){
 }
 
 async function loadUsersPanel(){
-  var data=await api('/admin/api/stats');
-  if(!data||data.error) return;
-  allUsers=data.all_users||[];
-  renderCatsPanel(data.categories||[]);
-  renderUsersTable();
+  try{
+    var r=await fetch('/admin/api/stats',{credentials:'same-origin',headers:{'content-type':'application/json'}});
+    var data=await r.json();
+    if(!data||data.error) return;
+    allUsers=data.all_users||[];
+    renderCatsPanel(data.categories||[]);
+    renderUsersTable();
 }
 
 function renderCatsPanel(cats){
@@ -2392,11 +2416,11 @@ checkSession();
 // PAGE ROUTES
 // ─────────────────────────────────────────
 app.get("/", wrap(async(req,res)=>{
-  trackView(req,'/');
+  trackView(req, res, '/');
   res.send(landingPage());
 }));
 app.get("/explore", wrap(async(req,res)=>{
-  trackView(req,'/explore');
+  trackView(req, res, '/explore');
   res.send(explorePage());
 }));
 app.get("/live", wrap(async(req,res)=>{
@@ -2408,7 +2432,7 @@ app.get("/debate/:id", wrap(async(req,res)=>{
   if(!Number.isFinite(id)) return res.redirect("/explore");
   const r=await pool.query("SELECT id,question,category,type FROM debates WHERE id=$1 AND active=TRUE",[id]);
   if(!r.rows[0]) return res.redirect("/explore");
-  trackView(req,'/debate/'+id);
+  trackView(req, res, '/debate/'+id);
   const d=r.rows[0];
   res.send(debatePage(d.id, d.question, d.category, d.type||'question'));
 }));
